@@ -64,8 +64,10 @@ static void record_pcr (MpegTSPacketizer2 * packetizer, MpegTSPCR * pcrtable,
 #define TABLE_ID_UNSET 0xFF
 #define PACKET_SYNC_BYTE 0x47
 
+extern int PROGRAM_NUMBER;      //mod
+
 static inline MpegTSPCR *
-get_pcr_table (MpegTSPacketizer2 * packetizer, guint16 pid)
+get_pcr_table (MpegTSPacketizer2 *packetizer, guint16 pid)
 {
   MpegTSPCR *res;
 
@@ -101,14 +103,14 @@ get_pcr_table (MpegTSPacketizer2 * packetizer, guint16 pid)
 }
 
 static void
-pcr_offset_group_free (PCROffsetGroup * group)
+pcr_offset_group_free (PCROffsetGroup *group)
 {
   g_free (group->values);
   g_free (group);
 }
 
 static void
-flush_observations (MpegTSPacketizer2 * packetizer)
+flush_observations (MpegTSPacketizer2 *packetizer)
 {
   gint i;
 
@@ -124,7 +126,7 @@ flush_observations (MpegTSPacketizer2 * packetizer)
 }
 
 GstClockTime
-mpegts_packetizer_get_current_time (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_get_current_time (MpegTSPacketizer2 *packetizer,
     guint16 pcr_pid)
 {
   MpegTSPCR *pcrtable = get_pcr_table (packetizer, pcr_pid);
@@ -137,7 +139,7 @@ mpegts_packetizer_get_current_time (MpegTSPacketizer2 * packetizer,
 }
 
 static inline MpegTSPacketizerStreamSubtable *
-find_subtable (GSList * subtables, guint8 table_id, guint16 subtable_extension)
+find_subtable (GSList *subtables, guint8 table_id, guint16 subtable_extension)
 {
   GSList *tmp;
 
@@ -154,7 +156,7 @@ find_subtable (GSList * subtables, guint8 table_id, guint16 subtable_extension)
 }
 
 static gboolean
-seen_section_before (MpegTSPacketizerStream * stream, guint8 table_id,
+seen_section_before (MpegTSPacketizerStream *stream, guint8 table_id,
     guint16 subtable_extension, guint8 version_number, guint8 section_number,
     guint8 last_section_number)
 {
@@ -208,7 +210,7 @@ mpegts_packetizer_stream_new (guint16 pid)
 }
 
 static void
-mpegts_packetizer_clear_section (MpegTSPacketizerStream * stream)
+mpegts_packetizer_clear_section (MpegTSPacketizerStream *stream)
 {
   stream->continuity_counter = CONTINUITY_UNSET;
   stream->section_length = 0;
@@ -219,14 +221,14 @@ mpegts_packetizer_clear_section (MpegTSPacketizerStream * stream)
 }
 
 static void
-mpegts_packetizer_stream_subtable_free (MpegTSPacketizerStreamSubtable *
-    subtable)
+mpegts_packetizer_stream_subtable_free (MpegTSPacketizerStreamSubtable
+    *subtable)
 {
   g_free (subtable);
 }
 
 static void
-mpegts_packetizer_stream_free (MpegTSPacketizerStream * stream)
+mpegts_packetizer_stream_free (MpegTSPacketizerStream *stream)
 {
   mpegts_packetizer_clear_section (stream);
   g_slist_foreach (stream->subtables,
@@ -236,7 +238,7 @@ mpegts_packetizer_stream_free (MpegTSPacketizerStream * stream)
 }
 
 static void
-mpegts_packetizer_class_init (MpegTSPacketizer2Class * klass)
+mpegts_packetizer_class_init (MpegTSPacketizer2Class *klass)
 {
   GObjectClass *gobject_class;
 
@@ -247,7 +249,7 @@ mpegts_packetizer_class_init (MpegTSPacketizer2Class * klass)
 }
 
 static void
-mpegts_packetizer_init (MpegTSPacketizer2 * packetizer)
+mpegts_packetizer_init (MpegTSPacketizer2 *packetizer)
 {
   g_mutex_init (&packetizer->group_lock);
 
@@ -278,7 +280,7 @@ mpegts_packetizer_init (MpegTSPacketizer2 * packetizer)
 }
 
 static void
-mpegts_packetizer_dispose (GObject * object)
+mpegts_packetizer_dispose (GObject *object)
 {
   MpegTSPacketizer2 *packetizer = GST_MPEGTS_PACKETIZER (object);
 
@@ -309,14 +311,14 @@ mpegts_packetizer_dispose (GObject * object)
 }
 
 static void
-mpegts_packetizer_finalize (GObject * object)
+mpegts_packetizer_finalize (GObject *object)
 {
   if (G_OBJECT_CLASS (mpegts_packetizer_parent_class)->finalize)
     G_OBJECT_CLASS (mpegts_packetizer_parent_class)->finalize (object);
 }
 
 static inline guint64
-mpegts_packetizer_compute_pcr (const guint8 * data)
+mpegts_packetizer_compute_pcr (const guint8 *data)
 {
   guint32 pcr1;
   guint16 pcr2;
@@ -331,11 +333,17 @@ mpegts_packetizer_compute_pcr (const guint8 * data)
 }
 
 static gboolean
-mpegts_packetizer_parse_adaptation_field_control (MpegTSPacketizer2 *
-    packetizer, MpegTSPacketizerPacket * packet)
+mpegts_packetizer_parse_adaptation_field_control (MpegTSPacketizer2 *packetizer,
+    MpegTSPacketizerPacket *packet)
 {
   guint8 length, afcflags;
   guint8 *data;
+
+  /*variables anyadidas para almacenar todos los flags y valores disponibles */
+  guint8 discontinuity_indicator, random_access_indicator,
+      elementary_stream_priority_indicator, PCR_flag, OPCR_flag,
+      splicing_point_flag, transport_private_data_flag,
+      adaptation_field_extension_flag;
 
   length = *packet->data++;
 
@@ -399,6 +407,15 @@ mpegts_packetizer_parse_adaptation_field_control (MpegTSPacketizer2 *
       afcflags & 0x02 ? "transport_private_data " : "",
       afcflags & 0x01 ? "extension " : "", afcflags == 0x00 ? "<none>" : "");
 
+  discontinuity_indicator = afcflags & 0x80;
+  random_access_indicator = afcflags & 0x40;
+  elementary_stream_priority_indicator = afcflags & 0x20;
+  PCR_flag = afcflags & 0x10;
+  OPCR_flag = afcflags & 0x08;
+  splicing_point_flag = afcflags & 0x04;
+  transport_private_data_flag = afcflags & 0x02;
+  adaptation_field_extension_flag = afcflags & 0x01;
+
   /* PCR */
   if (afcflags & MPEGTS_AFC_PCR_FLAG) {
     MpegTSPCR *pcrtable = NULL;
@@ -454,6 +471,171 @@ mpegts_packetizer_parse_adaptation_field_control (MpegTSPacketizer2 *
           GST_READ_UINT16_BE (data) & 0x7fff);
       data += 2;
     }
+    /*De aqui al final, anyadido para deteccion temi */
+    if ((flags & 0x10) == 0x00) {       /*Adaptation Field Extension Flags */
+      /*Entramos a comprobar TEEEEMIII */
+      guint8 af_descr_tag = *data++;
+      guint8 af_descr_length = *data++;
+      /*TEMI TAG 0x04 Timeline Descriptor */
+      /*TEMI TAG 0x05 Location Descriptor */
+      /*TEMI TAG 0x06 BaseURL Descriptor */
+
+      if (af_descr_tag == 0x05) {       /*TEMI TAG 0x05 Location Descriptor */
+        //guint8 temi_len = *data++; /*TEMI Length*/
+        //packet->exist_temi_location=1;
+        guint8 af_descr_flags = *data++;
+        guint8 af_descr_flags2 = *data++;
+        guint8 force_reload, is_announcement, splicing_flag, use_base_temi_url,
+            timeline_id;
+        force_reload = af_descr_flags & 0x80;
+        is_announcement = af_descr_flags & 0x40;
+        splicing_flag = af_descr_flags & 0x20;
+        use_base_temi_url = af_descr_flags & 0x10;
+        timeline_id = af_descr_flags2 & 0x7F;
+
+        if (is_announcement) {
+          guint32 timescale = GST_READ_UINT32_BE (data);
+          data += 4;
+          guint32 time_before_activation = GST_READ_UINT32_BE (data);
+          data += 4;
+
+        }
+        if (!use_base_temi_url) {
+          guint8 url_scheme = *data++;
+          guint8 url_path_length = *data++;
+          guint8 url_path[url_path_length + 1]; // +1 para anyadir caracter null
+          int i;
+          ////g_print("PREVIOUS URL PATH (af_descr_tag == 0x05): %s\n", packet->url_path);
+          for (i = 0; i < url_path_length; i++) {
+            url_path[i] = *data++;
+          }
+          url_path[url_path_length] = '\0';     // anyadido para que el array de char se marque su fin
+          ////g_print("URL PATH (af_descr_tag == 0x05): %s\n", url_path);
+          //insertar url_path en la struct packet
+          packet->url_path = url_path;
+          packet->url_path_length = url_path_length;
+          packet->has_url_path = 1;
+          packet->url_path = g_strdup (packet->url_path);
+          /*aunque la instruccion anterior parezca redundante, si no la hacemos
+           * a la hora de leer este parametro gchar* no se hara correctamente
+           * asi que hay que hacer una copia con el metodo g_strdup()
+           **/
+          ////g_print("PKTZR:packet->url_path: %s(%d)\n", packet->url_path, packet->url_path_length);
+        }
+        guint8 nb_addons = *data++;
+        int i, j;
+        for (i = 0; i < nb_addons; i++) {
+          guint8 service_type = *data++;
+          if (service_type == 0) {
+            guint8 mime_length = *data++;
+            guint8 mime_type[mime_length];
+            for (j = 0; j < mime_length; j++) {
+              mime_type[j] = *data++;
+            }
+          }
+          guint8 url_subpath_len = *data++;
+          guint8 addon_location[url_subpath_len];
+          for (j = 0; j < url_subpath_len; j++) {
+            addon_location[j] = *data++;
+          }
+        }
+      } else if (af_descr_tag == 0x06) {
+        guint8 url_scheme = *data++;
+        guint8 base_url_path[af_descr_length];
+        guint8 N = af_descr_length;
+        int i;
+        for (i = 0; i < N; i++) {
+          base_url_path[i] = *data++;
+        }
+      } else if (af_descr_tag == 0x04) {
+        //packet->exist_temi=1;
+        guint8 af_descr_flags = *data++;
+        guint8 af_descr_flags2 = *data++;
+        guint8 timeline_id = *data++;
+        ////g_print("TIMELINE ID: %x\n", timeline_id);
+
+        guint8 has_timestamp, has_ntp, has_ptp, has_timecode, force_reload,
+            paused, discontinuity;
+
+        has_timestamp = af_descr_flags & 0xC0;
+        has_ntp = af_descr_flags & 0x20;
+        has_ptp = af_descr_flags & 0x10;
+        has_timecode = af_descr_flags & 0x0C;
+        force_reload = af_descr_flags & 0x02;
+        paused = af_descr_flags & 0x01;
+        discontinuity = af_descr_flags2 & 0x80;
+
+        ////g_print("HAS TIMESTAMP: %x\n", has_timestamp);
+
+        if (has_timestamp) {
+          guint32 timescale = GST_READ_UINT32_BE (data);
+          //packet->temiscale=timescale;
+          ////g_print("TIMESCALE: %08x\n", timescale);
+          data += 4;
+          if (has_timestamp == 0x40) {
+            guint32 media_timestamp = GST_READ_UINT32_BE (data);
+            //packet->mediastamp=media_timestamp;
+            ////g_print("MEDIA TIMESTAMP 32b: %08x\n", media_timestamp);
+            data += 4;
+          } else if (has_timestamp == 0xC0) {
+            guint64 media_timestamp = GST_READ_UINT64_BE (data);
+            //packet->mediastamp=media_timestamp;
+            ////g_print("MEDIA TIMESTAMP 64b: %x", media_timestamp);
+            data += 8;
+          }
+        }
+        if (has_ntp) {
+          //data += 4;
+          guint32 ntp_timestamp1 = GST_READ_UINT32_BE (data);   //originalmente _BE
+          //guint64  ntp_timestamp = GST_READ_UINT64_BE(data);//da problemas de lectura en aplicacion final
+          //packet->ntp_timestamp=ntp_timestamp;
+          data += 4;
+          guint32 ntp_timestamp2 = GST_READ_UINT32_BE (data);
+          data += 4;
+          ////g_print("NTP TIMESTAMP: %16x\n", ntp_timestamp);
+          ////g_print("PID: %d\n", packet->pid);
+          ////g_print("NTP TIMESTAMP hex: %x\n", ntp_timestamp);
+          ////g_print("---------<<<<<<<<<<<<<<<<<<\nPACKETIZER->NTP_TIMESTAMP dec: %"G_GUINT64_FORMAT"\n---------<<<<<<<<<<<<<<<<<<\n", ntp_timestamp);
+          packet->ntp_timestamp1 = ntp_timestamp1;
+          packet->ntp_timestamp2 = ntp_timestamp2;
+          //packet->ntp_timestamp = ntp_timestamp;//da problemas de lectura en aplicacion final
+          packet->has_ntp_timestamp = 1;
+        }
+        /*if(!has_ntp){
+           packet->has_ntp_timestamp = 0;
+           } */
+        if (has_ptp) {
+          int i;
+          guint8 ptp_timestamp[10];
+          for (i = 0; i < 10; i++) {
+            ptp_timestamp[i] = *data++;
+          }
+          ////g_print("PTP TIMESTAMP: %x\n", ptp_timestamp);
+        }
+        if (has_timecode) {
+          guint16 drop_frames = GST_READ_UINT16_BE (data);
+          data += 2;
+          guint16 drop = drop_frames & 0x8000;
+          ////g_print("drop: %x\n", drop);
+          guint16 frames_per_tc_seconds = drop_frames & 0x7FFF;
+          ////g_print("frames per tc seconds: %x\n", frames_per_tc_seconds);
+          guint16 duration = GST_READ_UINT16_BE (data);
+          ////g_print("duration: %x\n", duration);
+          data += 2;
+          if (has_timecode == 1) {
+            guint8 short_time_code[3];
+            int i;
+            for (i = 0; i < 3; i++) {
+              short_time_code[i] = *data++;
+            }
+            ////g_print("short time code: %x\n", short_time_code);
+          } else if (has_timecode == 2) {
+            guint64 long_time_code = GST_READ_UINT64_BE (data);
+            ////g_print("long time code: %x\n", long_time_code);
+          }
+        }                       //has_timecode
+      }                         //0x04
+    }                           //adapt field extension flags
   }
 #endif
 
@@ -461,8 +643,8 @@ mpegts_packetizer_parse_adaptation_field_control (MpegTSPacketizer2 *
 }
 
 static MpegTSPacketizerPacketReturn
-mpegts_packetizer_parse_packet (MpegTSPacketizer2 * packetizer,
-    MpegTSPacketizerPacket * packet)
+mpegts_packetizer_parse_packet (MpegTSPacketizer2 *packetizer,
+    MpegTSPacketizerPacket *packet)
 {
   guint8 *data;
   guint8 tmp;
@@ -507,8 +689,8 @@ mpegts_packetizer_parse_packet (MpegTSPacketizer2 * packetizer,
 }
 
 static GstMpegtsSection *
-mpegts_packetizer_parse_section_header (MpegTSPacketizer2 * packetizer,
-    MpegTSPacketizerStream * stream)
+mpegts_packetizer_parse_section_header (MpegTSPacketizer2 *packetizer,
+    MpegTSPacketizerStream *stream)
 {
   MpegTSPacketizerStreamSubtable *subtable;
   GstMpegtsSection *res;
@@ -570,7 +752,7 @@ mpegts_packetizer_parse_section_header (MpegTSPacketizer2 * packetizer,
 }
 
 void
-mpegts_packetizer_clear (MpegTSPacketizer2 * packetizer)
+mpegts_packetizer_clear (MpegTSPacketizer2 *packetizer)
 {
   guint i;
   MpegTSPCR *pcrtable;
@@ -615,7 +797,7 @@ mpegts_packetizer_clear (MpegTSPacketizer2 * packetizer)
 }
 
 void
-mpegts_packetizer_flush (MpegTSPacketizer2 * packetizer, gboolean hard)
+mpegts_packetizer_flush (MpegTSPacketizer2 *packetizer, gboolean hard)
 {
   guint i;
   MpegTSPCR *pcrtable;
@@ -661,7 +843,7 @@ mpegts_packetizer_flush (MpegTSPacketizer2 * packetizer, gboolean hard)
 }
 
 void
-mpegts_packetizer_remove_stream (MpegTSPacketizer2 * packetizer, gint16 pid)
+mpegts_packetizer_remove_stream (MpegTSPacketizer2 *packetizer, gint16 pid)
 {
   MpegTSPacketizerStream *stream = packetizer->streams[pid];
   if (stream) {
@@ -683,7 +865,7 @@ mpegts_packetizer_new (void)
 }
 
 void
-mpegts_packetizer_push (MpegTSPacketizer2 * packetizer, GstBuffer * buffer)
+mpegts_packetizer_push (MpegTSPacketizer2 *packetizer, GstBuffer *buffer)
 {
   GstClockTime ts;
   if (G_UNLIKELY (packetizer->empty)) {
@@ -705,7 +887,7 @@ mpegts_packetizer_push (MpegTSPacketizer2 * packetizer, GstBuffer * buffer)
 }
 
 static void
-mpegts_packetizer_flush_bytes (MpegTSPacketizer2 * packetizer, gsize size)
+mpegts_packetizer_flush_bytes (MpegTSPacketizer2 *packetizer, gsize size)
 {
   if (size > 0) {
     GST_LOG ("flushing %" G_GSIZE_FORMAT " bytes from adapter", size);
@@ -718,7 +900,7 @@ mpegts_packetizer_flush_bytes (MpegTSPacketizer2 * packetizer, gsize size)
 }
 
 static gboolean
-mpegts_packetizer_map (MpegTSPacketizer2 * packetizer, gsize size)
+mpegts_packetizer_map (MpegTSPacketizer2 *packetizer, gsize size)
 {
   gsize available;
 
@@ -745,7 +927,7 @@ mpegts_packetizer_map (MpegTSPacketizer2 * packetizer, gsize size)
 }
 
 static gboolean
-mpegts_try_discover_packet_size (MpegTSPacketizer2 * packetizer)
+mpegts_try_discover_packet_size (MpegTSPacketizer2 *packetizer)
 {
   guint8 *data;
   gsize size, i, j;
@@ -801,7 +983,7 @@ out:
 }
 
 static gboolean
-mpegts_packetizer_sync (MpegTSPacketizer2 * packetizer)
+mpegts_packetizer_sync (MpegTSPacketizer2 *packetizer)
 {
   gboolean found = FALSE;
   guint8 *data;
@@ -839,8 +1021,8 @@ mpegts_packetizer_sync (MpegTSPacketizer2 * packetizer)
 }
 
 MpegTSPacketizerPacketReturn
-mpegts_packetizer_next_packet (MpegTSPacketizer2 * packetizer,
-    MpegTSPacketizerPacket * packet)
+mpegts_packetizer_next_packet (MpegTSPacketizer2 *packetizer,
+    MpegTSPacketizerPacket *packet)
 {
   guint8 *packet_data;
   guint packet_size;
@@ -892,7 +1074,7 @@ mpegts_packetizer_next_packet (MpegTSPacketizer2 * packetizer,
 }
 
 MpegTSPacketizerPacketReturn
-mpegts_packetizer_process_next_packet (MpegTSPacketizer2 * packetizer)
+mpegts_packetizer_process_next_packet (MpegTSPacketizer2 *packetizer)
 {
   MpegTSPacketizerPacket packet;
   MpegTSPacketizerPacketReturn ret;
@@ -905,8 +1087,8 @@ mpegts_packetizer_process_next_packet (MpegTSPacketizer2 * packetizer)
 }
 
 void
-mpegts_packetizer_clear_packet (MpegTSPacketizer2 * packetizer,
-    MpegTSPacketizerPacket * packet)
+mpegts_packetizer_clear_packet (MpegTSPacketizer2 *packetizer,
+    MpegTSPacketizerPacket *packet)
 {
   guint8 packet_size = packetizer->packet_size;
 
@@ -918,7 +1100,7 @@ mpegts_packetizer_clear_packet (MpegTSPacketizer2 * packetizer,
 }
 
 gboolean
-mpegts_packetizer_has_packets (MpegTSPacketizer2 * packetizer)
+mpegts_packetizer_has_packets (MpegTSPacketizer2 *packetizer)
 {
   if (G_UNLIKELY (!packetizer->packet_size)) {
     if (!mpegts_try_discover_packet_size (packetizer))
@@ -945,8 +1127,8 @@ mpegts_packetizer_has_packets (MpegTSPacketizer2 * packetizer)
  * be set to the beginning of a valid GList containing other sections.
  * */
 GstMpegtsSection *
-mpegts_packetizer_push_section (MpegTSPacketizer2 * packetizer,
-    MpegTSPacketizerPacket * packet, GList ** remaining)
+mpegts_packetizer_push_section (MpegTSPacketizer2 *packetizer,
+    MpegTSPacketizerPacket *packet, GList **remaining)
 {
   GstMpegtsSection *section;
   GstMpegtsSection *res = NULL;
@@ -1253,7 +1435,7 @@ _init_local (void)
 
 
 static void
-mpegts_packetizer_resync (MpegTSPCR * pcr, GstClockTime time,
+mpegts_packetizer_resync (MpegTSPCR *pcr, GstClockTime time,
     GstClockTime gstpcrtime, gboolean reset_skew)
 {
   pcr->base_time = time;
@@ -1335,8 +1517,8 @@ mpegts_packetizer_resync (MpegTSPCR * pcr, GstClockTime time,
  * Returns: @time adjusted with the clock skew.
  */
 static GstClockTime
-calculate_skew (MpegTSPacketizer2 * packetizer,
-    MpegTSPCR * pcr, guint64 pcrtime, GstClockTime time)
+calculate_skew (MpegTSPacketizer2 *packetizer,
+    MpegTSPCR *pcr, guint64 pcrtime, GstClockTime time)
 {
   guint64 send_diff, recv_diff;
   gint64 delta;
@@ -1600,7 +1782,7 @@ no_skew:
 }
 
 static void
-_reevaluate_group_pcr_offset (MpegTSPCR * pcrtable, PCROffsetGroup * group)
+_reevaluate_group_pcr_offset (MpegTSPCR *pcrtable, PCROffsetGroup *group)
 {
   PCROffsetGroup *prev = NULL;
 #ifndef GST_DISABLE_GST_DEBUG
@@ -1814,8 +1996,8 @@ _new_group (guint64 pcr, guint64 offset, guint64 pcr_offset, guint flags)
 }
 
 static void
-_insert_group_after (MpegTSPCR * pcrtable, PCROffsetGroup * group,
-    PCROffsetGroup * prev)
+_insert_group_after (MpegTSPCR *pcrtable, PCROffsetGroup *group,
+    PCROffsetGroup *prev)
 {
   if (prev == NULL) {
     /* First group */
@@ -1846,7 +2028,7 @@ _insert_group_after (MpegTSPCR * pcrtable, PCROffsetGroup * group,
 }
 
 static void
-_use_group (MpegTSPCR * pcrtable, PCROffsetGroup * group)
+_use_group (MpegTSPCR *pcrtable, PCROffsetGroup *group)
 {
   PCROffsetCurrent *current = pcrtable->current;
 
@@ -1863,8 +2045,8 @@ _use_group (MpegTSPCR * pcrtable, PCROffsetGroup * group)
 /* Create a new group with the specified values after prev
  * Set current to that new group */
 static void
-_set_current_group (MpegTSPCR * pcrtable,
-    PCROffsetGroup * prev, guint64 pcr, guint64 offset, gboolean contiguous)
+_set_current_group (MpegTSPCR *pcrtable,
+    PCROffsetGroup *prev, guint64 pcr, guint64 offset, gboolean contiguous)
 {
   PCROffsetGroup *group;
   guint flags = 0;
@@ -1916,7 +2098,7 @@ _set_current_group (MpegTSPCR * pcrtable,
 }
 
 static inline void
-_append_group_values (PCROffsetGroup * group, PCROffset pcroffset)
+_append_group_values (PCROffsetGroup *group, PCROffset pcroffset)
 {
   /* Only append if new values */
   if (group->values[group->last_value].offset == pcroffset.offset &&
@@ -1947,7 +2129,7 @@ _append_group_values (PCROffsetGroup * group, PCROffset pcroffset)
  * Note: This does not set the CLOSED flag (since we have no next
  * contiguous group) */
 static void
-_close_current_group (MpegTSPCR * pcrtable)
+_close_current_group (MpegTSPCR *pcrtable)
 {
   PCROffsetCurrent *current = pcrtable->current;
   PCROffsetGroup *group = current->group;
@@ -1963,7 +2145,7 @@ _close_current_group (MpegTSPCR * pcrtable)
 }
 
 static void
-record_pcr (MpegTSPacketizer2 * packetizer, MpegTSPCR * pcrtable,
+record_pcr (MpegTSPacketizer2 *packetizer, MpegTSPCR *pcrtable,
     guint64 pcr, guint64 offset)
 {
   PCROffsetCurrent *current = pcrtable->current;
@@ -2170,7 +2352,7 @@ record_pcr (MpegTSPacketizer2 * packetizer, MpegTSPCR * pcrtable,
 
 /* convert specified offset into stream time */
 GstClockTime
-mpegts_packetizer_offset_to_ts (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_offset_to_ts (MpegTSPacketizer2 *packetizer,
     guint64 offset, guint16 pid)
 {
   PCROffsetGroup *last;
@@ -2250,7 +2432,7 @@ mpegts_packetizer_offset_to_ts (MpegTSPacketizer2 * packetizer,
 /* Input  : local PTS (in GHz units)
  * Return : Stream time (in GHz units) */
 static GstClockTime
-mpegts_packetizer_pts_to_ts_internal (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_pts_to_ts_internal (MpegTSPacketizer2 *packetizer,
     GstClockTime pts, guint16 pcr_pid, gboolean check_diff)
 {
   GstClockTime res = GST_CLOCK_TIME_NONE;
@@ -2387,7 +2569,7 @@ mpegts_packetizer_pts_to_ts_internal (MpegTSPacketizer2 * packetizer,
 /* Input  : local PTS (in GHz units)
  * Return : Stream time (in GHz units) */
 GstClockTime
-mpegts_packetizer_pts_to_ts_unchecked (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_pts_to_ts_unchecked (MpegTSPacketizer2 *packetizer,
     GstClockTime pts, guint16 pcr_pid)
 {
   return mpegts_packetizer_pts_to_ts_internal (packetizer, pts, pcr_pid, FALSE);
@@ -2396,7 +2578,7 @@ mpegts_packetizer_pts_to_ts_unchecked (MpegTSPacketizer2 * packetizer,
 /* Input  : local PTS (in GHz units)
  * Return : Stream time (in GHz units) */
 GstClockTime
-mpegts_packetizer_pts_to_ts (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_pts_to_ts (MpegTSPacketizer2 *packetizer,
     GstClockTime pts, guint16 pcr_pid)
 {
   return mpegts_packetizer_pts_to_ts_internal (packetizer, pts, pcr_pid, TRUE);
@@ -2404,7 +2586,7 @@ mpegts_packetizer_pts_to_ts (MpegTSPacketizer2 * packetizer,
 
 /* Stream time to offset */
 guint64
-mpegts_packetizer_ts_to_offset (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_ts_to_offset (MpegTSPacketizer2 *packetizer,
     GstClockTime ts, guint16 pcr_pid)
 {
   MpegTSPCR *pcrtable;
@@ -2519,7 +2701,7 @@ calculate_points:
 }
 
 void
-mpegts_packetizer_set_reference_offset (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_set_reference_offset (MpegTSPacketizer2 *packetizer,
     guint64 refoffset)
 {
   GST_DEBUG ("Setting reference offset to %" G_GUINT64_FORMAT, refoffset);
@@ -2530,7 +2712,7 @@ mpegts_packetizer_set_reference_offset (MpegTSPacketizer2 * packetizer,
 }
 
 void
-mpegts_packetizer_set_pcr_discont_threshold (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_set_pcr_discont_threshold (MpegTSPacketizer2 *packetizer,
     GstClockTime threshold)
 {
   PACKETIZER_GROUP_LOCK (packetizer);
@@ -2539,7 +2721,7 @@ mpegts_packetizer_set_pcr_discont_threshold (MpegTSPacketizer2 * packetizer,
 }
 
 void
-mpegts_packetizer_set_current_pcr_offset (MpegTSPacketizer2 * packetizer,
+mpegts_packetizer_set_current_pcr_offset (MpegTSPacketizer2 *packetizer,
     GstClockTime offset, guint16 pcr_pid)
 {
   guint64 pcr_offset;

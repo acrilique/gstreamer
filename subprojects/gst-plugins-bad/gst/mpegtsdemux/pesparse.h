@@ -190,6 +190,9 @@ typedef struct {
 
   gsize		extension_field_length;   /* Length of remaining extension field data */
   const guint8*	stream_id_extension_data; /* Valid if extension_field_length != 0 */
+
+  guint64 slice_type_nalu; //mod
+
 } PESHeader;
 
 G_GNUC_INTERNAL PESParsingResult mpegts_parse_pes_header (const guint8* data,

@@ -32,6 +32,8 @@
 GST_DEBUG_CATEGORY_STATIC (pes_parser_debug);
 #define GST_CAT_DEFAULT pes_parser_debug
 
+guint32 contador_tramas;
+
 /**
  * mpegts_parse_pes_header:
  * @data: data to parse (starting from, and including, the sync code)
@@ -45,7 +47,7 @@ GST_DEBUG_CATEGORY_STATIC (pes_parser_debug);
  * is needed to properly parse the header.
  */
 PESParsingResult
-mpegts_parse_pes_header (const guint8 * data, gsize length, PESHeader * res)
+mpegts_parse_pes_header (const guint8 *data, gsize length, PESHeader *res)
 {
   PESParsingResult ret = PES_PARSING_NEED_MORE;
   gsize origlength = length;
@@ -388,6 +390,142 @@ stuffing_byte:
   /* Go to the expected data start position */
   data = origdata + res->header_size;
   length = origlength - res->header_size;
+
+
+
+  /****************************************************/
+  /*                     MODIFICACION IIM                                 */
+  /****************************************************/
+
+  /*Lectura Tipo de trama segun T-REC-H.264-201304 */
+  guint32 leading_zero_8bits;
+
+  if (leading_zero_8bits = *(data + 3) == 000001) {
+    ////g_print("leading_zero_8bits: 0x%08x\n",leading_zero_8bits);
+
+    /* 7.3.1 Sintaxis de las unidades NAL
+     * 
+     * forbidden_zero_bit
+     * 
+     * nal_ref_idc
+     * 
+     * nal_unit_type
+     */
+
+    guint8 forbidden_zero_bit = *(data + 4);
+    ////g_print("forbidden_zero_bit: 0x%02x\n",forbidden_zero_bit );
+
+    //rbsp_byte
+    guint8 rbsp_byte = *(data + 5);
+    ////g_print("rbsp_byte: 0x%02x\n",rbsp_byte );
+
+    if (leading_zero_8bits = *(data + 9) == 000001) {
+      ////g_print("fin tren bits: 0x%08x\n",leading_zero_8bits);
+      guint8 slice_header = *(data + 10);
+
+      guint8 first_mb_in_slice = (guint8) ((slice_header & 0xf0));
+      ////g_print("first_mb_in_slice: 0x%02x\n",first_mb_in_slice);
+
+      guint8 slice_type = (guint8) (slice_header & 0x0f);
+      res->slice_type_nalu = slice_type;
+
+      contador_tramas = contador_tramas + 1;
+
+      if (slice_type == 0x07) {
+        //g_print("slice_type: I-slice\n");
+        //g_print("Trama nº %" G_GUINT64_FORMAT "\n",contador_tramas);
+      }
+
+      /* Cuadro 7-3 – Nombres correspondientes a slice_type
+       * 
+       *     Type             Description
+       * 
+       *0     P-slice.        Consists of P-macroblocks (each macro block is predicted using one reference frame) and / or I-macroblocks.
+       *1     B-slice.        Consists of B-macroblocks (each macroblock is predicted using one or two reference frames) and / or I-macroblocks.
+       *2     I-slice.        Contains only I-macroblocks. Each macroblock is predicted from previously coded blocks of the same slice.
+       *3     SP-slice.       Consists of P and / or I-macroblocks and lets you switch between encoded streams.
+       *4     SI-slice.       It consists of a special type of SI-macroblocks and lets you switch between encoded streams.
+       *5     P-slice.
+       *6     B-slice.
+       *7     I-slice.
+       *8     SP-slice.
+       *9     SI-slice.
+       */
+
+      /*
+         ////g_print("slice_type: 0x%02x\n",slice_type);
+         //g_print("- - - - - - - - - -\n");
+         if (slice_type == 0x00){//g_print("slice_type: P-slice\n");}
+         if (slice_type == 0x01){//g_print("slice_type: B-slice\n");}
+         if (slice_type == 0x02){//g_print("slice_type: I-slice\n");}
+         if (slice_type == 0x03){//g_print("slice_type: SP-slice\n");}
+         if (slice_type == 0x04){//g_print("slice_type: SI-slice\n");}
+         if (slice_type == 0x05){//g_print("slice_type: P-slice\n");}
+         if (slice_type == 0x06){//g_print("slice_type: B-slice\n");}
+         if (slice_type == 0x07){
+         //g_print("slice_type: I-slice\n");
+         //g_print("PTS %" G_GUINT64_FORMAT " %" GST_TIME_FORMAT"\n",res->PTS, GST_TIME_ARGS (MPEGTIME_TO_GSTTIME (res->PTS)));
+         }
+         if (slice_type == 0x08){//g_print("slice_type: SP-slice\n");}
+         if (slice_type == 0x09){//g_print("slice_type: SI-slice\n");}
+         //g_print("- - - - - - - - - -\n");
+       */
+    }                           // fin tren de bits
+
+  }                             //if 0x000001
+
+  else if (leading_zero_8bits = *(data + 5) == 00000001) {
+    //g_print("leading_zero_8bits: 0x%08x\n",leading_zero_8bits );
+
+    guint8 forbidden_zero_bit = *(data + 6);;   // forbidden_zero_bit igual a 0x0
+    //g_print("forbidden_zero_bit: 0x%0x\n",forbidden_zero_bit );
+
+    //rbsp_byte
+    guint8 rbsp_byte = *(data + 7);
+    ////g_print("rbsp_byte: 0x%02x\n",rbsp_byte );
+
+    if (leading_zero_8bits = *(data + 11) == 000001) {
+      ////g_print("fin tren bits: 0x%08x\n",leading_zero_8bits);
+      guint8 slice_header = *(data + 12);
+
+      guint8 first_mb_in_slice = (guint8) ((slice_header & 0xf0));
+      ////g_print("first_mb_in_slice: 0x%02x\n",first_mb_in_slice);
+
+      guint8 slice_type = (guint8) (slice_header & 0x0f);
+      /*
+       *Type  Description
+       *0     P-slice. Consists of P-macroblocks (each macro block is predicted using one reference frame) and / or I-macroblocks.
+       *1     B-slice. Consists of B-macroblocks (each macroblock is predicted using one or two reference frames) and / or I-macroblocks.
+       *2     I-slice. Contains only I-macroblocks. Each macroblock is predicted from previously coded blocks of the same slice.
+       *3     SP-slice. Consists of P and / or I-macroblocks and lets you switch between encoded streams.
+       *4     SI-slice. It consists of a special type of SI-macroblocks and lets you switch between encoded streams.
+       *5     P-slice.
+       *6     B-slice.
+       *7     I-slice.
+       *8     SP-slice.
+       *9     SI-slice.
+       */
+
+      /*
+         ////g_print("slice_type: 0x%02x\n",slice_type);
+         //g_print("- - - - - - - - - -\n");
+         if (slice_type == 0x00){//g_print("slice_type: P-slice\n");}
+         if (slice_type == 0x01){//g_print("slice_type: B-slice\n");}
+         if (slice_type == 0x02){//g_print("slice_type: I-slice\n");}
+         if (slice_type == 0x03){//g_print("slice_type: SP-slice\n");}
+         if (slice_type == 0x04){//g_print("slice_type: SI-slice\n");}
+         if (slice_type == 0x05){//g_print("slice_type: P-slice\n");}
+         if (slice_type == 0x06){//g_print("slice_type: B-slice\n");}
+         if (slice_type == 0x07){//g_print("slice_type: I-slice\n");}
+         if (slice_type == 0x08){//g_print("slice_type: SP-slice\n");}
+         if (slice_type == 0x09){//g_print("slice_type: SI-slice\n");}
+         //g_print("- - - - - - - - - -\n");
+       */
+    }                           // fin tren de bits
+  }                             //else if 00000001
+
+  /*                      FIN MODIFICACION                        */
+
 
 done_parsing:
   GST_DEBUG ("origlength:%" G_GSIZE_FORMAT ", length:%" G_GSIZE_FORMAT,

@@ -78,6 +78,12 @@ struct _GstTSDemux
   gboolean emit_statistics;
   gboolean send_scte35_events;
   gint latency; /* latency in ms */
+  guint32 ntp_timestamp1;//mod
+  guint32 ntp_timestamp2;
+  guint32 pts_raw1;
+  guint32 pts_raw2;
+  gchar *url_path;
+
 
   /*< private >*/
   gint program_generation; /* Incremented each time we switch program 0..15 */

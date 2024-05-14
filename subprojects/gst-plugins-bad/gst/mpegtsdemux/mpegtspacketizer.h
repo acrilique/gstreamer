@@ -316,6 +316,15 @@ typedef struct
   guint8  afc_flags;
   guint64 pcr;
   guint64 offset;
+
+  guint32 ntp_timestamp1;//mod
+  guint32 ntp_timestamp2;
+  //guint64 ntp_timestamp;//da problemas de lectura en aplicacion final
+  guint has_ntp_timestamp;
+  guint has_url_path;
+  gchar *url_path;
+  guint8 url_path_length;
+  
 } MpegTSPacketizerPacket;
 
 typedef struct

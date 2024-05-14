@@ -34,6 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <time.h>               //mod
+
 #include <glib.h>
 #include <gst/tag/tag.h>
 #include <gst/pbutils/pbutils.h>
@@ -87,6 +89,14 @@ GST_DEBUG_CATEGORY_STATIC (ts_demux_debug);
 #define GST_CAT_DEFAULT ts_demux_debug
 
 #define ABSDIFF(a,b) (((a) > (b)) ? ((a) - (b)) : ((b) - (a)))
+
+#define DEFAULT_NTP_TIMESTAMP 0 //mod
+#define DEFAULT_PTS_RAW 0
+
+static GQuark QUARK_TEMI_H;     //mod 
+static GQuark QUARK_TEMI_L;
+static GQuark QUARK_SLICE_TYPE;
+static GQuark QUARK_SYSTEM_TIME;
 
 static GQuark QUARK_TSDEMUX;
 static GQuark QUARK_PID;
@@ -230,6 +240,9 @@ struct _TSDemuxStream
   TSDemuxADTSParsingInfos atdsInfos;
 };
 
+gboolean I_FRAME = TRUE;        //mod
+guint64 system_time = 1;
+
 #define VIDEO_CAPS \
   GST_STATIC_CAPS (\
     "video/mpeg, " \
@@ -303,6 +316,11 @@ enum
   PROP_EMIT_STATS,
   PROP_LATENCY,
   PROP_SEND_SCTE35_EVENTS,
+  NTP_TIMESTAMP1,               //mod
+  NTP_TIMESTAMP2,
+  PTS_RAW1,
+  PTS_RAW2,
+  URL_PATH,
   /* FILL ME */
 };
 
@@ -351,6 +369,11 @@ static void handle_psi (MpegTSBase * base, GstMpegtsSection * section);
 static void
 _extra_init (void)
 {
+  QUARK_TEMI_H = g_quark_from_string ("temi_h");        //mod
+  QUARK_TEMI_L = g_quark_from_string ("temi_l");
+  QUARK_SLICE_TYPE = g_quark_from_string ("slicetype");
+  QUARK_SYSTEM_TIME = g_quark_from_string ("system_time");
+
   QUARK_TSDEMUX = g_quark_from_string ("tsdemux");
   QUARK_PID = g_quark_from_string ("pid");
   QUARK_PCR = g_quark_from_string ("pcr");
@@ -371,7 +394,7 @@ GST_ELEMENT_REGISTER_DEFINE_WITH_CODE (tsdemux, "tsdemux",
     GST_RANK_PRIMARY, GST_TYPE_TS_DEMUX, _do_element_init);
 
 static void
-gst_ts_demux_dispose (GObject * object)
+gst_ts_demux_dispose (GObject *object)
 {
   GstTSDemux *demux = GST_TS_DEMUX_CAST (object);
 
@@ -381,7 +404,7 @@ gst_ts_demux_dispose (GObject * object)
 }
 
 static void
-gst_ts_demux_finalize (GObject * object)
+gst_ts_demux_finalize (GObject *object)
 {
   GstTSDemux *demux = GST_TS_DEMUX_CAST (object);
 
@@ -392,7 +415,7 @@ gst_ts_demux_finalize (GObject * object)
 }
 
 static void
-gst_ts_demux_class_init (GstTSDemuxClass * klass)
+gst_ts_demux_class_init (GstTSDemuxClass *klass)
 {
   GObjectClass *gobject_class;
   GstElementClass *element_class;
@@ -436,6 +459,33 @@ gst_ts_demux_class_init (GstTSDemuxClass * klass)
           G_MAXINT, DEFAULT_LATENCY,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  //mod
+  g_object_class_install_property (gobject_class, NTP_TIMESTAMP1,
+      g_param_spec_uint ("ntp-timestamp1", "NTP timestamp1",
+          "Devuelve valor ntp-timestamp1 de TEMI",
+          0, G_MAXUINT, DEFAULT_NTP_TIMESTAMP,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, NTP_TIMESTAMP2,
+      g_param_spec_uint ("ntp-timestamp2", "NTP timestamp2",
+          "Devuelve valor ntp-timestamp2 de TEMI",
+          0, G_MAXUINT, DEFAULT_NTP_TIMESTAMP,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PTS_RAW1,
+      g_param_spec_uint ("pts-raw1", "PTS raw 1",
+          "Devuelve valor pts-raw1",
+          0, G_MAXUINT, DEFAULT_PTS_RAW,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PTS_RAW2,
+      g_param_spec_uint ("pts-raw2", "PTS raw 2",
+          "Devuelve valor pts-raw2",
+          0, G_MAXUINT, DEFAULT_PTS_RAW,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, URL_PATH,
+      g_param_spec_string ("url-path", "Url Path",
+          "Devuelve la direccion url hbbtv",
+          "------", G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  //endmod
+
   element_class = GST_ELEMENT_CLASS (klass);
   gst_element_class_add_pad_template (element_class,
       gst_static_pad_template_get (&video_template));
@@ -471,7 +521,7 @@ gst_ts_demux_class_init (GstTSDemuxClass * klass)
 }
 
 static void
-gst_ts_demux_reset (MpegTSBase * base)
+gst_ts_demux_reset (MpegTSBase *base)
 {
   GstTSDemux *demux = (GstTSDemux *) base;
 
@@ -500,7 +550,7 @@ gst_ts_demux_reset (MpegTSBase * base)
 }
 
 static void
-gst_ts_demux_init (GstTSDemux * demux)
+gst_ts_demux_init (GstTSDemux *demux)
 {
   MpegTSBase *base = (MpegTSBase *) demux;
 
@@ -513,6 +563,11 @@ gst_ts_demux_init (GstTSDemux * demux)
   demux->requested_program_number = -1;
   demux->program_number = -1;
   demux->latency = DEFAULT_LATENCY;
+  demux->ntp_timestamp1 = DEFAULT_NTP_TIMESTAMP;        //mod
+  demux->ntp_timestamp2 = DEFAULT_NTP_TIMESTAMP;
+  demux->pts_raw1 = DEFAULT_PTS_RAW;
+  demux->pts_raw2 = DEFAULT_PTS_RAW;
+  demux->url_path = "----";     //endmod
   gst_ts_demux_reset (base);
 
   g_mutex_init (&demux->lock);
@@ -520,8 +575,8 @@ gst_ts_demux_init (GstTSDemux * demux)
 
 
 static void
-gst_ts_demux_set_property (GObject * object, guint prop_id,
-    const GValue * value, GParamSpec * pspec)
+gst_ts_demux_set_property (GObject *object, guint prop_id,
+    const GValue *value, GParamSpec *pspec)
 {
   GstTSDemux *demux = GST_TS_DEMUX (object);
 
@@ -546,8 +601,8 @@ gst_ts_demux_set_property (GObject * object, guint prop_id,
 }
 
 static void
-gst_ts_demux_get_property (GObject * object, guint prop_id,
-    GValue * value, GParamSpec * pspec)
+gst_ts_demux_get_property (GObject *object, guint prop_id,
+    GValue *value, GParamSpec *pspec)
 {
   GstTSDemux *demux = GST_TS_DEMUX (object);
 
@@ -564,13 +619,30 @@ gst_ts_demux_get_property (GObject * object, guint prop_id,
     case PROP_LATENCY:
       g_value_set_int (value, demux->latency);
       break;
+      //mod
+    case NTP_TIMESTAMP1:
+      g_value_set_uint (value, demux->ntp_timestamp1);
+      break;
+    case NTP_TIMESTAMP2:
+      g_value_set_uint (value, demux->ntp_timestamp2);
+      break;
+    case PTS_RAW1:             //aqui se consulta
+      g_value_set_uint (value, demux->pts_raw1);
+      break;
+    case PTS_RAW2:
+      g_value_set_uint (value, demux->pts_raw2);
+      break;
+    case URL_PATH:
+      g_value_set_string (value, demux->url_path);
+      break;
+      //endmod
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
 }
 
 static gboolean
-gst_ts_demux_get_duration (GstTSDemux * demux, GstClockTime * dur)
+gst_ts_demux_get_duration (GstTSDemux *demux, GstClockTime *dur)
 {
   MpegTSBase *base = (MpegTSBase *) demux;
   gboolean res = FALSE;
@@ -594,7 +666,7 @@ gst_ts_demux_get_duration (GstTSDemux * demux, GstClockTime * dur)
 }
 
 static gboolean
-gst_ts_demux_srcpad_query (GstPad * pad, GstObject * parent, GstQuery * query)
+gst_ts_demux_srcpad_query (GstPad *pad, GstObject *parent, GstQuery *query)
 {
   gboolean res = TRUE;
   GstFormat format;
@@ -706,7 +778,7 @@ gst_ts_demux_srcpad_query (GstPad * pad, GstObject * parent, GstQuery * query)
 }
 
 static void
-clear_simple_buffer (SimpleBuffer * sbuf)
+clear_simple_buffer (SimpleBuffer *sbuf)
 {
   if (!sbuf->data)
     return;
@@ -717,7 +789,7 @@ clear_simple_buffer (SimpleBuffer * sbuf)
 }
 
 static gboolean
-scan_keyframe_h264 (TSDemuxStream * stream, const guint8 * data,
+scan_keyframe_h264 (TSDemuxStream *stream, const guint8 *data,
     const gsize data_size, const gsize max_frame_offset)
 {
   gint offset = 0;
@@ -893,8 +965,8 @@ typedef struct
 } OffsetInfo;
 
 static gboolean
-gst_ts_demux_adjust_seek_offset_for_keyframe (TSDemuxStream * stream,
-    guint8 * data, guint64 size)
+gst_ts_demux_adjust_seek_offset_for_keyframe (TSDemuxStream *stream,
+    guint8 *data, guint64 size)
 {
   int scan_pid = -1;
 
@@ -911,7 +983,7 @@ gst_ts_demux_adjust_seek_offset_for_keyframe (TSDemuxStream * stream,
 }
 
 static GstFlowReturn
-gst_ts_demux_do_seek (MpegTSBase * base, GstEvent * event)
+gst_ts_demux_do_seek (MpegTSBase *base, GstEvent *event)
 {
   GList *tmp;
 
@@ -1023,7 +1095,7 @@ done:
 }
 
 static gboolean
-gst_ts_demux_srcpad_event (GstPad * pad, GstObject * parent, GstEvent * event)
+gst_ts_demux_srcpad_event (GstPad *pad, GstObject *parent, GstEvent *event)
 {
   gboolean res = TRUE;
   GstTSDemux *demux = GST_TS_DEMUX (parent);
@@ -1046,14 +1118,14 @@ gst_ts_demux_srcpad_event (GstPad * pad, GstObject * parent, GstEvent * event)
 }
 
 static void
-clean_global_taglist (GstTagList * taglist)
+clean_global_taglist (GstTagList *taglist)
 {
   gst_tag_list_remove_tag (taglist, GST_TAG_CONTAINER_FORMAT);
   gst_tag_list_remove_tag (taglist, GST_TAG_CODEC);
 }
 
 static gboolean
-push_event (MpegTSBase * base, GstEvent * event)
+push_event (MpegTSBase *base, GstEvent *event)
 {
   GstTSDemux *demux = (GstTSDemux *) base;
   GList *tmp;
@@ -1126,7 +1198,7 @@ push_event (MpegTSBase * base, GstEvent * event)
 }
 
 static void
-handle_psi (MpegTSBase * base, GstMpegtsSection * section)
+handle_psi (MpegTSBase *base, GstMpegtsSection *section)
 {
   GstTSDemux *demux = (GstTSDemux *) base;
 
@@ -1207,7 +1279,7 @@ handle_psi (MpegTSBase * base, GstMpegtsSection * section)
 }
 
 static gboolean
-sink_query (MpegTSBase * base, GstQuery * query)
+sink_query (MpegTSBase *base, GstQuery *query)
 {
   GstTSDemux *demux = (GstTSDemux *) base;
   gboolean res = FALSE;
@@ -1242,7 +1314,7 @@ sink_query (MpegTSBase * base, GstQuery * query)
 }
 
 static inline void
-add_iso639_language_to_tags (TSDemuxStream * stream, gchar * lang_code)
+add_iso639_language_to_tags (TSDemuxStream *stream, gchar *lang_code)
 {
   const gchar *lc;
 
@@ -1261,7 +1333,7 @@ add_iso639_language_to_tags (TSDemuxStream * stream, gchar * lang_code)
 }
 
 static void
-gst_ts_demux_create_tags (TSDemuxStream * stream)
+gst_ts_demux_create_tags (TSDemuxStream *stream)
 {
   MpegTSBaseStream *bstream = (MpegTSBaseStream *) stream;
   const GstMpegtsDescriptor *desc = NULL;
@@ -1349,8 +1421,8 @@ gst_ts_demux_create_tags (TSDemuxStream * stream)
 }
 
 static GstPad *
-create_pad_for_stream (MpegTSBase * base, MpegTSBaseStream * bstream,
-    MpegTSBaseProgram * program)
+create_pad_for_stream (MpegTSBase *base, MpegTSBaseStream *bstream,
+    MpegTSBaseProgram *program)
 {
   GstTSDemux *demux = GST_TS_DEMUX (base);
   TSDemuxStream *stream = (TSDemuxStream *) bstream;
@@ -2043,8 +2115,8 @@ done:
 }
 
 static gboolean
-gst_ts_demux_stream_added (MpegTSBase * base, MpegTSBaseStream * bstream,
-    MpegTSBaseProgram * program)
+gst_ts_demux_stream_added (MpegTSBase *base, MpegTSBaseStream *bstream,
+    MpegTSBaseProgram *program)
 {
   GstTSDemux *demux = (GstTSDemux *) base;
   TSDemuxStream *stream = (TSDemuxStream *) bstream;
@@ -2091,7 +2163,7 @@ gst_ts_demux_stream_added (MpegTSBase * base, MpegTSBaseStream * bstream,
 }
 
 static void
-tsdemux_h264_parsing_info_clear (TSDemuxH264ParsingInfos * h264infos)
+tsdemux_h264_parsing_info_clear (TSDemuxH264ParsingInfos *h264infos)
 {
   clear_simple_buffer (&h264infos->framedata);
 
@@ -2104,7 +2176,7 @@ tsdemux_h264_parsing_info_clear (TSDemuxH264ParsingInfos * h264infos)
 }
 
 static void
-gst_ts_demux_stream_removed (MpegTSBase * base, MpegTSBaseStream * bstream)
+gst_ts_demux_stream_removed (MpegTSBase *base, MpegTSBaseStream *bstream)
 {
   TSDemuxStream *stream = (TSDemuxStream *) bstream;
 
@@ -2143,7 +2215,7 @@ gst_ts_demux_stream_removed (MpegTSBase * base, MpegTSBaseStream * bstream)
 }
 
 static void
-activate_pad_for_stream (GstTSDemux * tsdemux, TSDemuxStream * stream)
+activate_pad_for_stream (GstTSDemux *tsdemux, TSDemuxStream *stream)
 {
   if (stream->pad) {
     GST_DEBUG_OBJECT (tsdemux, "Activating pad %s:%s for stream %p",
@@ -2160,7 +2232,7 @@ activate_pad_for_stream (GstTSDemux * tsdemux, TSDemuxStream * stream)
 }
 
 static void
-gst_ts_demux_stream_flush (TSDemuxStream * stream, GstTSDemux * tsdemux,
+gst_ts_demux_stream_flush (TSDemuxStream *stream, GstTSDemux *tsdemux,
     gboolean hard)
 {
   GST_DEBUG ("flushing stream %p", stream);
@@ -2205,7 +2277,7 @@ gst_ts_demux_stream_flush (TSDemuxStream * stream, GstTSDemux * tsdemux,
 }
 
 static void
-gst_ts_demux_flush_streams (GstTSDemux * demux, gboolean hard)
+gst_ts_demux_flush_streams (GstTSDemux *demux, gboolean hard)
 {
   GList *walk;
   if (!demux->program)
@@ -2216,7 +2288,7 @@ gst_ts_demux_flush_streams (GstTSDemux * demux, gboolean hard)
 }
 
 static gboolean
-gst_ts_demux_can_remove_program (MpegTSBase * base, MpegTSBaseProgram * program)
+gst_ts_demux_can_remove_program (MpegTSBase *base, MpegTSBaseProgram *program)
 {
   GstTSDemux *demux = GST_TS_DEMUX (base);
 
@@ -2233,7 +2305,7 @@ gst_ts_demux_can_remove_program (MpegTSBase * base, MpegTSBaseProgram * program)
 }
 
 static void
-gst_ts_demux_update_program (MpegTSBase * base, MpegTSBaseProgram * program)
+gst_ts_demux_update_program (MpegTSBase *base, MpegTSBaseProgram *program)
 {
   GstTSDemux *demux = GST_TS_DEMUX (base);
   GList *tmp;
@@ -2265,7 +2337,7 @@ gst_ts_demux_update_program (MpegTSBase * base, MpegTSBaseProgram * program)
 }
 
 static void
-gst_ts_demux_program_started (MpegTSBase * base, MpegTSBaseProgram * program)
+gst_ts_demux_program_started (MpegTSBase *base, MpegTSBaseProgram *program)
 {
   GstTSDemux *demux = GST_TS_DEMUX (base);
 
@@ -2357,7 +2429,7 @@ gst_ts_demux_program_started (MpegTSBase * base, MpegTSBaseProgram * program)
 }
 
 static void
-gst_ts_demux_program_stopped (MpegTSBase * base, MpegTSBaseProgram * program)
+gst_ts_demux_program_stopped (MpegTSBase *base, MpegTSBaseProgram *program)
 {
   GstTSDemux *demux = GST_TS_DEMUX (base);
 
@@ -2369,8 +2441,7 @@ gst_ts_demux_program_stopped (MpegTSBase * base, MpegTSBaseProgram * program)
 
 
 static inline void
-gst_ts_demux_record_pts (GstTSDemux * demux, TSDemuxStream * stream,
-    guint64 pts, guint64 offset)
+gst_ts_demux_record_pts (GstTSDemux *demux, TSDemuxStream *stream, guint64 slice_type_nalu, guint64 pts, guint64 offset)        //mod
 {
   MpegTSBaseStream *bs = (MpegTSBaseStream *) stream;
   MpegTSBase *base = GST_MPEGTS_BASE (demux);
@@ -2383,6 +2454,15 @@ gst_ts_demux_record_pts (GstTSDemux * demux, TSDemuxStream * stream,
 
   GST_LOG ("pid 0x%04x raw pts:%" G_GUINT64_FORMAT " at offset %"
       G_GUINT64_FORMAT, bs->pid, pts, offset);
+
+  if (slice_type_nalu == 7) {   //mod
+    long int start_time;
+    struct timespec gettime_now;
+
+    clock_gettime (CLOCK_REALTIME, &gettime_now);
+    start_time = gettime_now.tv_nsec;
+    system_time = (guint64) start_time;
+  }
 
   /* Compute PTS in GstClockTime */
   stream->pts =
@@ -2412,9 +2492,8 @@ gst_ts_demux_record_pts (GstTSDemux * demux, TSDemuxStream * stream,
   if (G_UNLIKELY (demux->emit_statistics)) {
     GstStructure *st;
     st = gst_structure_new_id_empty (QUARK_TSDEMUX);
-    gst_structure_id_set (st,
-        QUARK_PID, G_TYPE_UINT, bs->pid,
-        QUARK_OFFSET, G_TYPE_UINT64, offset, QUARK_PTS, G_TYPE_UINT64, pts,
+    gst_structure_id_set (st, QUARK_PID, G_TYPE_UINT, bs->pid, QUARK_OFFSET, G_TYPE_UINT64, offset, QUARK_PTS, G_TYPE_UINT64, pts, QUARK_SLICE_TYPE, G_TYPE_UINT64, slice_type_nalu,    //mod
+        QUARK_SYSTEM_TIME, G_TYPE_UINT64, system_time, QUARK_TEMI_H, G_TYPE_UINT64, demux->ntp_timestamp1, QUARK_TEMI_L, G_TYPE_UINT64, demux->ntp_timestamp2,  //endmod
         NULL);
     gst_element_post_message (GST_ELEMENT_CAST (demux),
         gst_message_new_element (GST_OBJECT (demux), st));
@@ -2422,7 +2501,7 @@ gst_ts_demux_record_pts (GstTSDemux * demux, TSDemuxStream * stream,
 }
 
 static inline void
-gst_ts_demux_record_dts (GstTSDemux * demux, TSDemuxStream * stream,
+gst_ts_demux_record_dts (GstTSDemux *demux, TSDemuxStream *stream,
     guint64 dts, guint64 offset)
 {
   MpegTSBaseStream *bs = (MpegTSBaseStream *) stream;
@@ -2446,8 +2525,7 @@ gst_ts_demux_record_dts (GstTSDemux * demux, TSDemuxStream * stream,
   if (G_UNLIKELY (demux->emit_statistics)) {
     GstStructure *st;
     st = gst_structure_new_id_empty (QUARK_TSDEMUX);
-    gst_structure_id_set (st,
-        QUARK_PID, G_TYPE_UINT, bs->pid,
+    gst_structure_id_set (st, QUARK_PID, G_TYPE_UINT, bs->pid,  // en la modificacion de dani esto es G_TYPE_UINT64
         QUARK_OFFSET, G_TYPE_UINT64, offset, QUARK_DTS, G_TYPE_UINT64, dts,
         NULL);
     gst_element_post_message (GST_ELEMENT_CAST (demux),
@@ -2457,7 +2535,7 @@ gst_ts_demux_record_dts (GstTSDemux * demux, TSDemuxStream * stream,
 
 /* This is called when we haven't got a valid initial PTS/DTS on all streams */
 static gboolean
-check_pending_buffers (GstTSDemux * demux)
+check_pending_buffers (GstTSDemux *demux)
 {
   gboolean have_observation = FALSE;
   /* The biggest offset */
@@ -2622,8 +2700,8 @@ check_pending_buffers (GstTSDemux * demux)
 }
 
 static void
-gst_ts_demux_parse_pes_header (GstTSDemux * demux, TSDemuxStream * stream,
-    guint8 * data, guint32 length, guint64 bufferoffset)
+gst_ts_demux_parse_pes_header (GstTSDemux *demux, TSDemuxStream *stream,
+    guint8 *data, guint32 length, guint64 bufferoffset)
 {
   PESHeader header;
   PESParsingResult parseres;
@@ -2663,9 +2741,9 @@ gst_ts_demux_parse_pes_header (GstTSDemux * demux, TSDemuxStream * stream,
   }
 
   gst_ts_demux_record_dts (demux, stream, header.DTS, bufferoffset);
-  gst_ts_demux_record_pts (demux, stream, header.PTS, bufferoffset);
-  if (G_UNLIKELY (stream->pending_ts &&
-          (stream->pts != GST_CLOCK_TIME_NONE
+  gst_ts_demux_record_pts (demux, stream, header.slice_type_nalu, header.PTS,
+      bufferoffset);
+  if (G_UNLIKELY (stream->pending_ts && (stream->pts != GST_CLOCK_TIME_NONE
               || stream->dts != GST_CLOCK_TIME_NONE))) {
     GST_DEBUG ("Got pts/dts update, rechecking all streams");
     check_pending_buffers (demux);
@@ -2732,8 +2810,8 @@ discont:
   * * WITH pending/current flushed out if beginning of new PES packet
   */
 static inline void
-gst_ts_demux_queue_data (GstTSDemux * demux, TSDemuxStream * stream,
-    MpegTSPacketizerPacket * packet)
+gst_ts_demux_queue_data (GstTSDemux *demux, TSDemuxStream *stream,
+    MpegTSPacketizerPacket *packet)
 {
   guint8 *data;
   guint size;
@@ -2798,6 +2876,15 @@ gst_ts_demux_queue_data (GstTSDemux * demux, TSDemuxStream * stream,
 
       /* parse the header */
       gst_ts_demux_parse_pes_header (demux, stream, data, size, packet->offset);
+      demux->ntp_timestamp1 = packet->ntp_timestamp1;   //mod
+      demux->ntp_timestamp2 = packet->ntp_timestamp2;
+      if (packet->has_url_path == 1) {
+        int i = 0;
+        ////g_print("DMX:packet->url_path: >>%s<< >(%d)<\n", packet->url_path, packet->url_path_length);
+        demux->url_path = strdup (packet->url_path);
+        ////g_print("DMX:demux->url_path: >>%s<<\n", demux->url_path);
+        packet->has_url_path = 0;
+      }                         //endmod
       break;
     }
     case PENDING_PACKET_BUFFER:
@@ -2836,8 +2923,8 @@ gst_ts_demux_queue_data (GstTSDemux * demux, TSDemuxStream * stream,
 }
 
 static void
-calculate_and_push_newsegment (GstTSDemux * demux, TSDemuxStream * stream,
-    MpegTSBaseProgram * target_program)
+calculate_and_push_newsegment (GstTSDemux *demux, TSDemuxStream *stream,
+    MpegTSBaseProgram *target_program)
 {
   MpegTSBase *base = (MpegTSBase *) demux;
   GstClockTime lowest_pts = GST_CLOCK_TIME_NONE;
@@ -2956,7 +3043,7 @@ push_new_segment:
 }
 
 static void
-gst_ts_demux_check_and_sync_streams (GstTSDemux * demux, GstClockTime time)
+gst_ts_demux_check_and_sync_streams (GstTSDemux *demux, GstClockTime time)
 {
   GList *tmp;
 
@@ -3026,7 +3113,7 @@ gst_ts_demux_check_and_sync_streams (GstTSDemux * demux, GstClockTime time)
 }
 
 static GstBufferList *
-parse_opus_access_unit (TSDemuxStream * stream)
+parse_opus_access_unit (TSDemuxStream *stream)
 {
   GstByteReader reader;
   GstBufferList *buffer_list = NULL;
@@ -3122,7 +3209,7 @@ error:
 /* interlaced mode is disabled at the moment */
 /*#define TSDEMUX_JP2K_SUPPORT_INTERLACE */
 static GstBuffer *
-parse_jp2k_access_unit (TSDemuxStream * stream)
+parse_jp2k_access_unit (TSDemuxStream *stream)
 {
   GstByteReader reader;
   /* header tag */
@@ -3279,7 +3366,7 @@ error:
 }
 
 static GstBuffer *
-parse_aac_adts_frame (TSDemuxStream * stream)
+parse_aac_adts_frame (TSDemuxStream *stream)
 {
   gint data_location = -1;
   guint frame_len;
@@ -3351,7 +3438,7 @@ out:
 }
 
 static GstBufferList *
-parse_pes_metadata_frame (TSDemuxStream * stream)
+parse_pes_metadata_frame (TSDemuxStream *stream)
 {
   GstByteReader reader;
   GstBufferList *buffer_list = NULL;
@@ -3420,8 +3507,8 @@ error:
 }
 
 static GstFlowReturn
-gst_ts_demux_push_pending_data (GstTSDemux * demux, TSDemuxStream * stream,
-    MpegTSBaseProgram * target_program)
+gst_ts_demux_push_pending_data (GstTSDemux *demux, TSDemuxStream *stream,
+    MpegTSBaseProgram *target_program)
 {
   MpegTSBase *base = GST_MPEGTS_BASE (demux);
   GstFlowReturn res = GST_FLOW_OK;
@@ -3717,8 +3804,8 @@ beach:
 }
 
 static GstFlowReturn
-gst_ts_demux_handle_packet (GstTSDemux * demux, TSDemuxStream * stream,
-    MpegTSPacketizerPacket * packet, GstMpegtsSection * section)
+gst_ts_demux_handle_packet (GstTSDemux *demux, TSDemuxStream *stream,
+    MpegTSPacketizerPacket *packet, GstMpegtsSection *section)
 {
   GstFlowReturn res = GST_FLOW_OK;
 
@@ -3762,7 +3849,7 @@ gst_ts_demux_handle_packet (GstTSDemux * demux, TSDemuxStream * stream,
 }
 
 static void
-gst_ts_demux_flush (MpegTSBase * base, gboolean hard)
+gst_ts_demux_flush (MpegTSBase *base, gboolean hard)
 {
   GstTSDemux *demux = GST_TS_DEMUX_CAST (base);
 
@@ -3783,7 +3870,7 @@ gst_ts_demux_flush (MpegTSBase * base, gboolean hard)
 }
 
 static GstFlowReturn
-gst_ts_demux_drain (MpegTSBase * base)
+gst_ts_demux_drain (MpegTSBase *base)
 {
   GstTSDemux *demux = GST_TS_DEMUX_CAST (base);
   GList *tmp;
@@ -3805,8 +3892,8 @@ gst_ts_demux_drain (MpegTSBase * base)
 }
 
 static GstFlowReturn
-gst_ts_demux_push (MpegTSBase * base, MpegTSPacketizerPacket * packet,
-    GstMpegtsSection * section)
+gst_ts_demux_push (MpegTSBase *base, MpegTSPacketizerPacket *packet,
+    GstMpegtsSection *section)
 {
   GstTSDemux *demux = GST_TS_DEMUX_CAST (base);
   TSDemuxStream *stream = NULL;
