@@ -869,8 +869,6 @@ gst_base_auto_convert_sink_setcaps (GstBaseAutoConvert * self, GstCaps * caps,
     if (gst_base_auto_convert_activate_element (self, element, caps)) {
       res = TRUE;
       break;
-    } else {
-      gst_object_unref (element);
     }
   }
 
@@ -1150,6 +1148,16 @@ gst_base_auto_convert_sink_query (GstPad * pad, GstObject * parent,
         goto ignore_acceptcaps_failure;
     }
     return ret;
+  }
+
+  /* Should not forward the allocation query downstream directly
+   * if no subelement is selected, otherwise it can influence
+   * the downstream allocation choices and upstream buffer usage.
+   */
+  if (GST_QUERY_TYPE (query) == GST_QUERY_ALLOCATION) {
+    GST_DEBUG_OBJECT (self,
+        "no subelement is selected yet, can't answer ALLOCATION query");
+    return FALSE;
   }
 
 ignore_acceptcaps_failure:

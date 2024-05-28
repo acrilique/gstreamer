@@ -277,6 +277,12 @@ foreach f : check_functions
   endif
 endforeach
 
+if host_system == 'windows'
+  if cc.has_function('_set_thread_local_invalid_parameter_handler', prefix : '#include <stdlib.h>')
+    cdata.set('HAVE__SET_THREAD_LOCAL_INVALID_PARAMETER_HANDLER', 1)
+  endif
+endif
+
 if cc.has_function('localtime_r', prefix : '#include<time.h>')
   cdata.set('HAVE_LOCALTIME_R', 1)
   # Needed by libcheck
@@ -566,6 +572,21 @@ mathlib = cc.find_library('m', required : false)
 # Needed for timer_create/settime/delete
 # Also provides clock_gettime in glibc < 2.17
 rt_lib = cc.find_library('rt', required : false)
+
+#
+# Solaris and Illumos distros split a lot of networking-related code
+# into '-lsocket -lnsl'.  Anything that calls socketpair(), getifaddr(),
+# etc. probably needs to include network_deps
+#
+socket_lib = cc.find_library('socket', required: false)
+nsl_lib    = cc.find_library('nsl',    required: false)
+network_deps = []
+if socket_lib.found()
+  network_deps += socket_lib
+endif
+if nsl_lib.found()
+  network_deps += nsl_lib
+endif
 
 gir = find_program('g-ir-scanner', required : get_option('introspection'))
 gnome = import('gnome')

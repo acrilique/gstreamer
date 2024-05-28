@@ -229,6 +229,8 @@ struct _GstVaH264Enc
     guint32 ref_num_list1;
 
     guint num_reorder_frames;
+
+    GstVideoCodecFrame *last_keyframe;
   } gop;
 
   struct
@@ -260,7 +262,7 @@ struct _GstVaH264Enc
 
 struct _GstVaH264EncFrame
 {
-  GstVaEncodePicture *picture;
+  GstVaEncFrame base;
   GstH264SliceType type;
   gboolean is_ref;
   guint pyramid_level;
@@ -376,7 +378,7 @@ gst_va_enc_frame_new (void)
   frame = g_new (GstVaH264EncFrame, 1);
   frame->frame_num = 0;
   frame->unused_for_reference_pic_num = -1;
-  frame->picture = NULL;
+  frame->base.picture = NULL;
   frame->last_frame = FALSE;
 
   return frame;
@@ -386,16 +388,14 @@ static void
 gst_va_enc_frame_free (gpointer pframe)
 {
   GstVaH264EncFrame *frame = pframe;
-  g_clear_pointer (&frame->picture, gst_va_encode_picture_free);
+  g_clear_pointer (&frame->base.picture, gst_va_encode_picture_free);
   g_free (frame);
 }
 
 static inline GstVaH264EncFrame *
 _enc_frame (GstVideoCodecFrame * frame)
 {
-  GstVaH264EncFrame *enc_frame = gst_video_codec_frame_get_user_data (frame);
-  g_assert (enc_frame);
-  return enc_frame;
+  return gst_va_get_enc_frame (frame);
 }
 
 /* Normalizes bitrate (and CPB size) for HRD conformance */
@@ -1531,6 +1531,7 @@ gst_va_h264_enc_reset_state (GstVaBaseEnc * base)
   self->gop.ref_num_list0 = 0;
   self->gop.ref_num_list1 = 0;
   self->gop.num_reorder_frames = 0;
+  self->gop.last_keyframe = NULL;
 
   self->rc.max_bitrate = 0;
   self->rc.target_bitrate = 0;
@@ -1552,13 +1553,16 @@ gst_va_h264_enc_reconfig (GstVaBaseEnc * base)
   GstVideoFormat format, reconf_format = GST_VIDEO_FORMAT_UNKNOWN;
   VAProfile profile = VAProfileNone;
   gboolean do_renegotiation = TRUE, do_reopen, need_negotiation;
-  guint max_ref_frames, max_surfaces = 0, rt_format = 0, codedbuf_size;
+  guint max_ref_frames, max_surfaces = 0, rt_format = 0,
+      codedbuf_size, latency_num;
   gint width, height;
+  GstClockTime latency;
 
   width = GST_VIDEO_INFO_WIDTH (&base->in_info);
   height = GST_VIDEO_INFO_HEIGHT (&base->in_info);
   format = GST_VIDEO_INFO_FORMAT (&base->in_info);
   codedbuf_size = base->codedbuf_size;
+  latency_num = base->preferred_output_delay + self->gop.ip_period - 1;
 
   need_negotiation =
       !gst_va_encoder_get_reconstruct_pool_config (base->encoder, &reconf_caps,
@@ -1582,6 +1586,13 @@ gst_va_h264_enc_reconfig (GstVaBaseEnc * base)
     gst_va_encoder_close (base->encoder);
 
   gst_va_base_enc_reset_state (base);
+
+  if (base->is_live) {
+    base->preferred_output_delay = 0;
+  } else {
+    /* FIXME: An experience value for most of the platforms. */
+    base->preferred_output_delay = 4;
+  }
 
   base->profile = profile;
   base->rt_format = rt_format;
@@ -1635,7 +1646,22 @@ gst_va_h264_enc_reconfig (GstVaBaseEnc * base)
   self->cc = self->cc && self->packed_headers & VA_ENC_PACKED_HEADER_RAW_DATA;
   update_property_bool (base, &self->prop.cc, self->cc, PROP_CC);
 
-  max_ref_frames = self->gop.num_ref_frames + 3 /* scratch frames */ ;
+  /* Let the downstream know the new latency. */
+  if (latency_num != base->preferred_output_delay + self->gop.ip_period - 1) {
+    need_negotiation = TRUE;
+    latency_num = base->preferred_output_delay + self->gop.ip_period - 1;
+  }
+
+  /* Set the latency */
+  latency = gst_util_uint64_scale (latency_num,
+      GST_VIDEO_INFO_FPS_D (&base->input_state->info) * GST_SECOND,
+      GST_VIDEO_INFO_FPS_N (&base->input_state->info));
+  gst_video_encoder_set_latency (venc, latency, latency);
+
+  max_ref_frames = self->gop.num_ref_frames;
+  max_ref_frames += base->preferred_output_delay;
+  base->min_buffers = max_ref_frames;
+  max_ref_frames += 3 /* scratch frames */ ;
 
   /* second check after calculations */
   do_reopen |=
@@ -1694,64 +1720,104 @@ gst_va_h264_enc_reconfig (GstVaBaseEnc * base)
   return TRUE;
 }
 
+static void
+frame_setup_from_gop (GstVaH264Enc * self, GstVaH264EncFrame * frame, guint i)
+{
+  g_assert (i < 1024);
+
+  frame->type = self->gop.frame_types[i].slice_type;
+  frame->is_ref = self->gop.frame_types[i].is_ref;
+  frame->pyramid_level = self->gop.frame_types[i].pyramid_level;
+  frame->left_ref_poc_diff = self->gop.frame_types[i].left_ref_poc_diff;
+  frame->right_ref_poc_diff = self->gop.frame_types[i].right_ref_poc_diff;
+}
+
 static gboolean
 _push_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame * gst_frame,
     gboolean last)
 {
   GstVaH264Enc *self = GST_VA_H264_ENC (base);
   GstVaH264EncFrame *frame;
+  gboolean add_cached_key_frame = FALSE;
 
   g_return_val_if_fail (self->gop.cur_frame_index <= self->gop.idr_period,
       FALSE);
 
   if (gst_frame) {
-    /* Begin a new GOP, should have a empty reorder_list. */
-    if (self->gop.cur_frame_index == self->gop.idr_period) {
-      g_assert (g_queue_is_empty (&base->reorder_list));
-      self->gop.cur_frame_index = 0;
-      self->gop.cur_frame_num = 0;
-    }
-
     frame = _enc_frame (gst_frame);
-    frame->poc =
-        ((self->gop.cur_frame_index * 2) % self->gop.max_pic_order_cnt);
 
-    /* TODO: move most this logic onto vabaseenc class  */
-    if (self->gop.cur_frame_index == 0) {
-      g_assert (frame->poc == 0);
-      GST_LOG_OBJECT (self, "system_frame_number: %d, an IDR frame, starts"
-          " a new GOP", gst_frame->system_frame_number);
+    /* Force to insert the key frame inside a GOP, just end the current
+       GOP and start a new one. */
+    if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (gst_frame) &&
+        !(self->gop.cur_frame_index == 0 ||
+            self->gop.cur_frame_index == self->gop.idr_period)) {
+      GST_DEBUG_OBJECT (base, "system_frame_number: %d is a force key "
+          "frame(IDR), begin a new GOP.", gst_frame->system_frame_number);
 
+      frame->poc = 0;
+      frame_setup_from_gop (self, frame, 0);
+
+      /* The previous key frame should be already be poped out. */
+      g_assert (self->gop.last_keyframe == NULL);
+
+      /* An empty reorder list, start the new GOP immediately. */
+      if (g_queue_is_empty (&base->reorder_list)) {
+        self->gop.cur_frame_index = 1;
+        self->gop.cur_frame_num = 0;
+        g_queue_clear_full (&base->ref_list,
+            (GDestroyNotify) gst_video_codec_frame_unref);
+        last = FALSE;
+      } else {
+        /* Cache the key frame and end the current GOP.
+           Next time calling this push() without frame, start the new GOP. */
+        self->gop.last_keyframe = gst_frame;
+        last = TRUE;
+      }
+
+      add_cached_key_frame = TRUE;
+    } else {
+      /* Begin a new GOP, should have a empty reorder_list. */
+      if (self->gop.cur_frame_index == self->gop.idr_period) {
+        g_assert (g_queue_is_empty (&base->reorder_list));
+        self->gop.cur_frame_index = 0;
+        self->gop.cur_frame_num = 0;
+      }
+
+      frame->poc =
+          ((self->gop.cur_frame_index * 2) % self->gop.max_pic_order_cnt);
+
+      /* TODO: move most this logic onto vabaseenc class  */
+      if (self->gop.cur_frame_index == 0) {
+        g_assert (frame->poc == 0);
+        GST_LOG_OBJECT (self, "system_frame_number: %d, an IDR frame, starts"
+            " a new GOP", gst_frame->system_frame_number);
+
+        g_queue_clear_full (&base->ref_list,
+            (GDestroyNotify) gst_video_codec_frame_unref);
+      }
+
+      frame_setup_from_gop (self, frame, self->gop.cur_frame_index);
+
+      GST_LOG_OBJECT (self, "Push frame, system_frame_number: %d, poc %d, "
+          "frame type %s", gst_frame->system_frame_number, frame->poc,
+          _slice_type_name (frame->type));
+
+      self->gop.cur_frame_index++;
+
+      g_queue_push_tail (&base->reorder_list,
+          gst_video_codec_frame_ref (gst_frame));
+    }
+  } else if (self->gop.last_keyframe) {
+    g_assert (self->gop.last_keyframe ==
+        g_queue_peek_tail (&base->reorder_list));
+    if (g_queue_get_length (&base->reorder_list) == 1) {
+      /* The last cached key frame begins a new GOP */
+      self->gop.cur_frame_index = 1;
+      self->gop.cur_frame_num = 0;
+      self->gop.last_keyframe = NULL;
       g_queue_clear_full (&base->ref_list,
           (GDestroyNotify) gst_video_codec_frame_unref);
-
-      GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (gst_frame);
     }
-
-    frame->type = self->gop.frame_types[self->gop.cur_frame_index].slice_type;
-    frame->is_ref = self->gop.frame_types[self->gop.cur_frame_index].is_ref;
-    frame->pyramid_level =
-        self->gop.frame_types[self->gop.cur_frame_index].pyramid_level;
-    frame->left_ref_poc_diff =
-        self->gop.frame_types[self->gop.cur_frame_index].left_ref_poc_diff;
-    frame->right_ref_poc_diff =
-        self->gop.frame_types[self->gop.cur_frame_index].right_ref_poc_diff;
-
-    if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (gst_frame)) {
-      GST_DEBUG_OBJECT (self, "system_frame_number: %d, a force key frame,"
-          " promote its type from %s to %s", gst_frame->system_frame_number,
-          _slice_type_name (frame->type), _slice_type_name (GST_H264_I_SLICE));
-      frame->type = GST_H264_I_SLICE;
-      frame->is_ref = TRUE;
-    }
-
-    GST_LOG_OBJECT (self, "Push frame, system_frame_number: %d, poc %d, "
-        "frame type %s", gst_frame->system_frame_number, frame->poc,
-        _slice_type_name (frame->type));
-
-    self->gop.cur_frame_index++;
-    g_queue_push_tail (&base->reorder_list,
-        gst_video_codec_frame_ref (gst_frame));
   }
 
   /* ensure the last one a non-B and end the GOP. */
@@ -1769,6 +1835,12 @@ _push_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame * gst_frame,
         frame->is_ref = TRUE;
       }
     }
+  }
+
+  /* Insert the cached next key frame after ending the current GOP. */
+  if (add_cached_key_frame) {
+    g_queue_push_tail (&base->reorder_list,
+        gst_video_codec_frame_ref (gst_frame));
   }
 
   return TRUE;
@@ -1792,7 +1864,7 @@ _count_backward_ref_num (gpointer data, gpointer user_data)
 }
 
 static GstVideoCodecFrame *
-_pop_pyramid_b_frame (GstVaH264Enc * self)
+_pop_pyramid_b_frame (GstVaH264Enc * self, guint gop_len)
 {
   GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
   guint i;
@@ -1807,7 +1879,7 @@ _pop_pyramid_b_frame (GstVaH264Enc * self)
   b_vaframe = NULL;
 
   /* Find the lowest level with smallest poc. */
-  for (i = 0; i < g_queue_get_length (&base->reorder_list); i++) {
+  for (i = 0; i < gop_len; i++) {
     GstVaH264EncFrame *vaf;
     GstVideoCodecFrame *f;
 
@@ -1839,7 +1911,7 @@ again:
   /* Check whether its refs are already poped. */
   g_assert (b_vaframe->left_ref_poc_diff != 0);
   g_assert (b_vaframe->right_ref_poc_diff != 0);
-  for (i = 0; i < g_queue_get_length (&base->reorder_list); i++) {
+  for (i = 0; i < gop_len; i++) {
     GstVaH264EncFrame *vaf;
     GstVideoCodecFrame *f;
 
@@ -1881,6 +1953,7 @@ _pop_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame ** out_frame)
   GstVaH264Enc *self = GST_VA_H264_ENC (base);
   GstVaH264EncFrame *vaframe;
   GstVideoCodecFrame *frame;
+  guint gop_len;
   struct RefFramesCount count;
 
   g_return_val_if_fail (self->gop.cur_frame_index <= self->gop.idr_period,
@@ -1891,16 +1964,21 @@ _pop_one_frame (GstVaBaseEnc * base, GstVideoCodecFrame ** out_frame)
   if (g_queue_is_empty (&base->reorder_list))
     return TRUE;
 
+  gop_len = g_queue_get_length (&base->reorder_list);
+
+  if (self->gop.last_keyframe && gop_len > 1)
+    gop_len--;
+
   /* Return the last pushed non-B immediately. */
-  frame = g_queue_peek_tail (&base->reorder_list);
+  frame = g_queue_peek_nth (&base->reorder_list, gop_len - 1);
   vaframe = _enc_frame (frame);
   if (vaframe->type != GST_H264_B_SLICE) {
-    frame = g_queue_pop_tail (&base->reorder_list);
+    frame = g_queue_pop_nth (&base->reorder_list, gop_len - 1);
     goto get_one;
   }
 
   if (self->gop.b_pyramid) {
-    frame = _pop_pyramid_b_frame (self);
+    frame = _pop_pyramid_b_frame (self, gop_len);
     if (frame == NULL)
       return TRUE;
     goto get_one;
@@ -2123,7 +2201,7 @@ _add_sequence_header (GstVaH264Enc * self, GstVaH264EncFrame * frame)
     return FALSE;
   }
 
-  if (!gst_va_encoder_add_packed_header (base->encoder, frame->picture,
+  if (!gst_va_encoder_add_packed_header (base->encoder, frame->base.picture,
           VAEncPackedHeaderSequence, packed_sps, size * 8, FALSE)) {
     GST_ERROR_OBJECT (self, "Failed to add the packed sequence header");
     return FALSE;
@@ -2250,10 +2328,10 @@ _fill_picture_parameter (GstVaH264Enc * self, GstVaH264EncFrame * frame,
   *pic_param = (VAEncPictureParameterBufferH264) {
     .CurrPic = {
       .picture_id =
-          gst_va_encode_picture_get_reconstruct_surface (frame->picture),
+          gst_va_encode_picture_get_reconstruct_surface (frame->base.picture),
       .TopFieldOrderCnt = frame->poc,
     },
-    .coded_buf = frame->picture->coded_buffer,
+    .coded_buf = frame->base.picture->coded_buffer,
     /* Only support one sps and pps now. */
     .pic_parameter_set_id = 0,
     .seq_parameter_set_id = 0,
@@ -2302,7 +2380,7 @@ _fill_picture_parameter (GstVaH264Enc * self, GstVaH264EncFrame * frame,
       f = _enc_frame (g_queue_peek_nth (&base->ref_list, i));
 
       pic_param->ReferenceFrames[i].picture_id =
-          gst_va_encode_picture_get_reconstruct_surface (f->picture);
+          gst_va_encode_picture_get_reconstruct_surface (f->base.picture);
       pic_param->ReferenceFrames[i].TopFieldOrderCnt = f->poc;
       pic_param->ReferenceFrames[i].flags =
           VA_PICTURE_H264_SHORT_TERM_REFERENCE;
@@ -2321,7 +2399,7 @@ _add_picture_parameter (GstVaH264Enc * self, GstVaH264EncFrame * frame,
 {
   GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
 
-  if (!gst_va_encoder_add_param (base->encoder, frame->picture,
+  if (!gst_va_encoder_add_param (base->encoder, frame->base.picture,
           VAEncPictureParameterBufferType, pic_param,
           sizeof (VAEncPictureParameterBufferH264))) {
     GST_ERROR_OBJECT (self, "Failed to create the picture parameter");
@@ -2385,7 +2463,7 @@ _add_picture_header (GstVaH264Enc * self, GstVaH264EncFrame * frame,
     return FALSE;
   }
 
-  if (!gst_va_encoder_add_packed_header (base->encoder, frame->picture,
+  if (!gst_va_encoder_add_packed_header (base->encoder, frame->base.picture,
           VAEncPackedHeaderPicture, packed_pps, size * 8, FALSE)) {
     GST_ERROR_OBJECT (self, "Failed to add the packed picture header");
     return FALSE;
@@ -2463,7 +2541,8 @@ _add_one_slice (GstVaH264Enc * self, GstVaH264EncFrame * frame,
   if (frame->type != GST_H264_I_SLICE) {
     for (; i < list0_num; i++) {
       slice->RefPicList0[i].picture_id =
-          gst_va_encode_picture_get_reconstruct_surface (list0[i]->picture);
+          gst_va_encode_picture_get_reconstruct_surface
+          (list0[i]->base.picture);
       slice->RefPicList0[i].TopFieldOrderCnt = list0[i]->poc;
       slice->RefPicList0[i].flags |= VA_PICTURE_H264_SHORT_TERM_REFERENCE;
       slice->RefPicList0[i].frame_idx = list0[i]->frame_num;
@@ -2478,7 +2557,8 @@ _add_one_slice (GstVaH264Enc * self, GstVaH264EncFrame * frame,
   if (frame->type == GST_H264_B_SLICE) {
     for (; i < list1_num; i++) {
       slice->RefPicList1[i].picture_id =
-          gst_va_encode_picture_get_reconstruct_surface (list1[i]->picture);
+          gst_va_encode_picture_get_reconstruct_surface
+          (list1[i]->base.picture);
       slice->RefPicList1[i].TopFieldOrderCnt = list1[i]->poc;
       slice->RefPicList1[i].flags |= VA_PICTURE_H264_SHORT_TERM_REFERENCE;
       slice->RefPicList1[i].frame_idx = list1[i]->frame_num;
@@ -2489,7 +2569,7 @@ _add_one_slice (GstVaH264Enc * self, GstVaH264EncFrame * frame,
     slice->RefPicList1[i].flags = VA_PICTURE_H264_INVALID;
   }
 
-  if (!gst_va_encoder_add_param (base->encoder, frame->picture,
+  if (!gst_va_encoder_add_param (base->encoder, frame->base.picture,
           VAEncSliceParameterBufferType, slice,
           sizeof (VAEncSliceParameterBufferH264))) {
     GST_ERROR_OBJECT (self, "Failed to create the slice parameter");
@@ -2720,7 +2800,7 @@ _add_slice_header (GstVaH264Enc * self, GstVaH264EncFrame * frame,
     return FALSE;
   }
 
-  if (!gst_va_encoder_add_packed_header (base->encoder, frame->picture,
+  if (!gst_va_encoder_add_packed_header (base->encoder, frame->base.picture,
           VAEncPackedHeaderSlice, packed_slice_hdr, size * 8 + trail_bits,
           FALSE)) {
     GST_ERROR_OBJECT (self, "Failed to add the packed slice header");
@@ -2760,7 +2840,7 @@ _add_aud (GstVaH264Enc * self, GstVaH264EncFrame * frame)
     return FALSE;
   }
 
-  if (!gst_va_encoder_add_packed_header (base->encoder, frame->picture,
+  if (!gst_va_encoder_add_packed_header (base->encoder, frame->base.picture,
           VAEncPackedHeaderRawData, aud_data, size * 8, FALSE)) {
     GST_ERROR_OBJECT (self, "Failed to add the AUD");
     return FALSE;
@@ -2875,7 +2955,7 @@ _add_sei_cc (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
     goto out;
   }
 
-  if (!gst_va_encoder_add_packed_header (base->encoder, frame->picture,
+  if (!gst_va_encoder_add_packed_header (base->encoder, frame->base.picture,
           VAEncPackedHeaderRawData, packed_sei, sei_size * 8, FALSE)) {
     GST_WARNING_OBJECT (self, "Failed to add SEI CC data");
     goto out;
@@ -2912,24 +2992,24 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
   if (frame->poc == 0) {
     VAEncSequenceParameterBufferH264 sequence;
 
-    if (!gst_va_base_enc_add_rate_control_parameter (base, frame->picture,
+    if (!gst_va_base_enc_add_rate_control_parameter (base, frame->base.picture,
             self->rc.rc_ctrl_mode, self->rc.max_bitrate_bits,
             self->rc.target_percentage, self->rc.qp_i, self->rc.min_qp,
             self->rc.max_qp, self->rc.mbbrc))
       return FALSE;
 
-    if (!gst_va_base_enc_add_quality_level_parameter (base, frame->picture,
+    if (!gst_va_base_enc_add_quality_level_parameter (base, frame->base.picture,
             self->rc.target_usage))
       return FALSE;
 
-    if (!gst_va_base_enc_add_frame_rate_parameter (base, frame->picture))
+    if (!gst_va_base_enc_add_frame_rate_parameter (base, frame->base.picture))
       return FALSE;
 
-    if (!gst_va_base_enc_add_hrd_parameter (base, frame->picture,
+    if (!gst_va_base_enc_add_hrd_parameter (base, frame->base.picture,
             self->rc.rc_ctrl_mode, self->rc.cpb_length_bits))
       return FALSE;
 
-    if (!gst_va_base_enc_add_trellis_parameter (base, frame->picture,
+    if (!gst_va_base_enc_add_trellis_parameter (base, frame->base.picture,
             self->use_trellis))
       return FALSE;
 
@@ -2937,7 +3017,7 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
     if (!_fill_sps (self, &sequence))
       return FALSE;
 
-    if (!_add_sequence_parameter (self, frame->picture, &sequence))
+    if (!_add_sequence_parameter (self, frame->base.picture, &sequence))
       return FALSE;
 
     if ((self->packed_headers & VA_ENC_PACKED_HEADER_SEQUENCE)
@@ -3034,7 +3114,7 @@ _encode_one_frame (GstVaH264Enc * self, GstVideoCodecFrame * gst_frame)
     slice_start_mb += slice_mbs;
   }
 
-  if (!gst_va_encoder_encode (base->encoder, frame->picture)) {
+  if (!gst_va_encoder_encode (base->encoder, frame->base.picture)) {
     GST_ERROR_OBJECT (self, "Encode frame error");
     return FALSE;
   }
@@ -3050,6 +3130,7 @@ gst_va_h264_enc_flush (GstVideoEncoder * venc)
   /* begin from an IDR after flush. */
   self->gop.cur_frame_index = 0;
   self->gop.cur_frame_num = 0;
+  self->gop.last_keyframe = NULL;
 
   return GST_VIDEO_ENCODER_CLASS (parent_class)->flush (venc);
 }
@@ -3074,7 +3155,7 @@ gst_va_h264_enc_prepare_output (GstVaBaseEnc * base,
   }
 
   buf = gst_va_base_enc_create_output_buffer (base,
-      frame_enc->picture, NULL, 0);
+      frame_enc->base.picture, NULL, 0);
   if (!buf) {
     GST_ERROR_OBJECT (base, "Failed to create output buffer");
     return FALSE;
@@ -3181,11 +3262,11 @@ gst_va_h264_enc_encode_frame (GstVaBaseEnc * base,
   frame = _enc_frame (gst_frame);
   frame->last_frame = is_last;
 
-  g_assert (frame->picture == NULL);
-  frame->picture = gst_va_encode_picture_new (base->encoder,
+  g_assert (frame->base.picture == NULL);
+  frame->base.picture = gst_va_encode_picture_new (base->encoder,
       gst_frame->input_buffer);
 
-  if (!frame->picture) {
+  if (!frame->base.picture) {
     GST_ERROR_OBJECT (self, "Failed to create the encode picture");
     return GST_FLOW_ERROR;
   }
@@ -3225,7 +3306,8 @@ gst_va_h264_enc_new_frame (GstVaBaseEnc * base, GstVideoCodecFrame * frame)
   GstVaH264EncFrame *frame_in;
 
   frame_in = gst_va_enc_frame_new ();
-  gst_video_codec_frame_set_user_data (frame, frame_in, gst_va_enc_frame_free);
+  gst_va_set_enc_frame (frame, (GstVaEncFrame *) frame_in,
+      gst_va_enc_frame_free);
 
   gst_va_base_enc_push_dts (base, frame, self->gop.num_reorder_frames);
 

@@ -211,7 +211,7 @@ static const struct shader_templ templ_RGB_to_AYUV =
     GST_GL_TEXTURE_TARGET_2D
   };
 
-static const char glsl_func_planar_yuv_to_yuva[] =
+static const char glsl_func_fetch_planar_yuv[] =
     "vec4 fetch_planar_yuv(sampler2D Ytex, sampler2D Utex, sampler2D Vtex, vec2 texcoord) {\n"
     "  vec4 yuva;\n"
     "  yuva.x = texture2D(Ytex, texcoord * tex_scale0).r * in_bitdepth_factor;\n"
@@ -237,7 +237,7 @@ static const gchar templ_PLANAR_YUV_to_RGB_BODY[] =
 static const struct shader_templ templ_PLANAR_YUV_to_RGB =
   { NULL,
     DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex, Utex, Vtex;\n" "uniform float in_bitdepth_factor;\n",
-    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_planar_yuv_to_yuva, NULL, },
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_fetch_planar_yuv, NULL, },
     GST_GL_TEXTURE_TARGET_2D
   };
 
@@ -252,7 +252,7 @@ static const struct shader_templ templ_A420_to_RGB =
   { NULL,
     /* 4th uniform is the alpha buffer */
     DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex, Utex, Vtex, Atex;\n" "uniform float in_bitdepth_factor;\n",
-    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_planar_yuv_to_yuva, NULL, },
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_fetch_planar_yuv, NULL, },
     GST_GL_TEXTURE_TARGET_2D
   };
 
@@ -506,61 +506,297 @@ static const struct shader_templ templ_RGB_to_SEMI_PLANAR_YUV =
 
 /* YUY2:r,g,a
    UYVY:a,b,r */
-static const gchar templ_YUY2_UYVY_to_RGB_BODY[] =
-    "vec4 uv_texel;\n"
-    "vec4 yuva;\n"
-    /* FIXME: should get the sampling right... */
-    "float dx1 = -poffset_x;\n"
-    "float dx2 = 0.0;\n"
-    "yuva.x = texture2D(Ytex, texcoord * tex_scale0).%c;\n"
+static const gchar glsl_func_YUY2_UYVY_unpack[] =
+    "vec4 yuy2_uyvy_unpack(sampler2D tex, vec2 v_texcoord, vec2 vert_to_tex, vec2 chroma_sampling) {\n"
+    "  vec4 yuva;\n"
+    "  float dx1 = -poffset_x;\n"
+    "  float dx2 = 0.0;\n"
+    "  yuva.x = texture2D(tex, v_texcoord * vert_to_tex * tex_scale0)[input_swizzle[0]];\n"
     /* v_texcoord are normalized, texcoord may not be e.g. rectangle textures */
-    "float inorder = mod (v_texcoord.x * width, 2.0);\n"
-    "if (inorder < 1.0) {\n"
-    "  dx2 = -dx1;\n"
-    "  dx1 = 0.0;\n"
-    "}\n"
-    "uv_texel.rg = texture2D(Ytex, texcoord * tex_scale0 + vec2(dx1, 0.0)).r%c;\n"
-    "uv_texel.ba = texture2D(Ytex, texcoord * tex_scale0 + vec2(dx2, 0.0)).r%c;\n"
-    "yuva.yz = uv_texel.%c%c;\n"
-    "yuva.a = 1.0;\n"
+    "  vec2 half_poffset = vec2(poffset_x / 2.0, poffset_y / 2.0);\n"
+    "  int inorder = int(((v_texcoord.x * vert_to_tex.x - half_poffset.x) * chroma_sampling.x + half_poffset.x) * width / vert_to_tex) % 2;\n"
+    "  if (inorder == 0) {\n"
+    "    dx2 = -dx1;\n"
+    "    dx1 = 0.0;\n"
+    "  }\n"
+    "  vec2 non_offset = v_texcoord * vert_to_tex * tex_scale0 - half_poffset;\n"
+    "  vec4 u_texel = texture2D(tex, non_offset * chroma_sampling + half_poffset + vec2(dx1, 0.0));\n"
+    "  vec4 v_texel = texture2D(tex, non_offset * chroma_sampling + half_poffset + vec2(dx2, 0.0));\n"
+    "  yuva.yz = vec2(u_texel[input_swizzle[1]], v_texel[input_swizzle[2]]);\n"
+    "  yuva.a = 1.0;\n"
+    "  return yuva;\n"
+    "}\n";
+
+static const gchar templ_YUY2_UYVY_to_RGB_BODY[] =
+    "vec4 yuva = yuy2_uyvy_unpack(Ytex, v_texcoord, vert_to_tex, vec2(1.0));\n"
     "vec4 rgba = color_matrix_apply(yuva, to_RGB_matrix);\n"
     "gl_FragColor = swizzle(rgba, output_swizzle);\n";
 
 static const struct shader_templ templ_YUY2_UYVY_to_RGB =
   { NULL,
-    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex;\n",
-    { glsl_func_swizzle, glsl_func_color_matrix, NULL, },
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_YUY2_UYVY_unpack, NULL, },
     GST_GL_TEXTURE_TARGET_2D
   };
 
-static const gchar templ_RGB_to_YUY2_UYVY_BODY[] =
-    "vec4 texel1, texel2;\n"
-    "vec4 yuva, yuv1, yuv2;\n"
-    "float fx, dx, fy;\n"
+static const gchar templ_YUY2_UYVY_to_PLANAR_YUV_BODY[] =
+    "vec4 yuva = yuy2_uyvy_unpack(Ytex, v_texcoord, vert_to_tex, chroma_sampling);\n"
+    "yuva = swizzle(yuva, output_swizzle) * out_bitdepth_factor;\n"
+    "write_planar_yuv(yuva);\n";
+
+static const struct shader_templ templ_YUY2_UYVY_to_PLANAR_YUV =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex;\n" "uniform vec2 chroma_sampling;\n" "uniform float out_bitdepth_factor;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_YUY2_UYVY_unpack, glsl_func_write_planar_yuv, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar templ_YUY2_UYVY_to_PLANAR_YUVA_BODY[] =
+    "vec4 yuva = yuy2_uyvy_unpack(Ytex, v_texcoord, vert_to_tex, chroma_sampling);\n"
+    "yuva = swizzle(yuva, output_swizzle) * out_bitdepth_factor;\n"
+    "write_planar_yuva(yuva);\n";
+
+static const struct shader_templ templ_YUY2_UYVY_to_PLANAR_YUVA =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex;\n" "uniform vec2 chroma_sampling;\n" "uniform float out_bitdepth_factor;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_YUY2_UYVY_unpack, glsl_func_write_planar_yuva, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar glsl_func_YUY2_UYVY_pack[] =
+    "ivec2 YUY2_UYVY_pack(vec2 texcoord, vec2 v_texcoord, out vec2 texcoord0, out vec2 texcoord1) {\n"
+    "  vec4 texel1, texel2;\n"
+    "  vec4 yuva, yuv1, yuv2;\n"
+    "  float fx, dx, fy;\n"
     /* v_texcoord are normalized, texcoord may not be e.g. rectangle textures */
-    "float inorder = mod (v_texcoord.x * width, 2.0);\n"
-    "fx = texcoord.x;\n"
-    "dx = poffset_x;\n"
-    "if (inorder > 1.0) {\n"
-    "  dx = -dx;\n"
-    "}\n"
-    "fy = texcoord.y;\n"
-    "texel1 = swizzle(texture2D(tex, vec2(fx, fy)), input_swizzle);\n"
-    "texel2 = swizzle(texture2D(tex, vec2(fx + dx, fy)), input_swizzle);\n"
-    "yuv1 = color_matrix_apply(texel1, to_YUV_matrix);\n"
-    "yuv2 = color_matrix_apply(texel2, to_YUV_matrix);\n"
-    "yuva.x = yuv1.x;\n"
-    "yuva.yz = (yuv1.yz + yuv2.yz) * 0.5;\n"
-    "if (inorder < 1.0) {\n"
-    "  gl_FragColor = vec4(yuva.%c, yuva.%c, 0.0, 0.0);\n"
-    "} else {\n"
-    "  gl_FragColor = vec4(yuva.%c, yuva.%c, 0.0, 0.0);\n"
+    "  float inorder = mod (v_texcoord.x * out_width, 2.0);\n"
+    "  fx = texcoord.x;\n"
+    "  dx = poffset_x;\n"
+    "  if (inorder > 1.0) {\n"
+    "    dx = -dx;\n"
+    "  }\n"
+    "  fy = texcoord.y;\n"
+    "  texcoord0 = vec2(fx, fy);\n"
+    "  texcoord1 = vec2(fx + dx, fy);\n"
+    "  if (inorder < 1.0) {\n"
+    "    return ivec2(output_swizzle[0], output_swizzle[1]);\n"
+    "  } else {\n"
+    "    return ivec2(output_swizzle[2], output_swizzle[3]);\n"
+    "  }\n"
     "}\n";
+
+static const gchar templ_RGB_to_YUY2_UYVY_BODY[] =
+    "vec2 texcoord0, texcoord1;\n"
+    "ivec2 idx = YUY2_UYVY_pack(texcoord, v_texcoord, texcoord0, texcoord1);\n"
+    "vec4 rgba0 = swizzle(texture2D(tex, texcoord0), input_swizzle);\n"
+    "vec4 rgba1 = swizzle(texture2D(tex, texcoord1), input_swizzle);\n"
+    "vec4 yuva0 = color_matrix_apply(rgba0, to_YUV_matrix);\n"
+    "vec4 yuva1 = color_matrix_apply(rgba1, to_YUV_matrix);\n"
+    "vec4 yuva;\n"
+    "yuva.x = yuva0.x;\n"
+    "yuva.yz = (yuva0.yz + yuva1.yz) * 0.5;\n"
+    "gl_FragColor = vec4(yuva[idx[0]], yuva[idx[1]], 0.0, 0.0);\n";
 
 static const struct shader_templ templ_RGB_to_YUY2_UYVY =
   { NULL,
-    DEFAULT_UNIFORMS RGB_TO_YUV_COEFFICIENTS "uniform sampler2D tex;\n",
-    { glsl_func_swizzle, glsl_func_color_matrix, NULL, },
+    DEFAULT_UNIFORMS RGB_TO_YUV_COEFFICIENTS "uniform sampler2D tex;\n" "uniform float out_width;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_YUY2_UYVY_pack, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar templ_PLANAR_YUV_to_YUY2_UYVY_BODY[] =
+    "vec2 texcoord0, texcoord1;\n"
+    "ivec2 idx = YUY2_UYVY_pack(texcoord, v_texcoord, texcoord0, texcoord1);\n"
+    "vec4 yuva0 = fetch_planar_yuv(Ytex, Utex, Vtex, texcoord0);\n"
+    "vec4 yuva1 = fetch_planar_yuv(Ytex, Utex, Vtex, texcoord1);\n"
+    "vec4 yuva;\n"
+    "yuva.x = yuva0.x;\n"
+    "yuva.yz = (yuva0.yz + yuva1.yz) * 0.5;\n"
+    "gl_FragColor = vec4(yuva[idx[0]], yuva[idx[1]], 0.0, 0.0);\n";
+
+static const struct shader_templ templ_PLANAR_YUV_to_YUY2_UYVY =
+  { NULL,
+    DEFAULT_UNIFORMS RGB_TO_YUV_COEFFICIENTS "uniform sampler2D Ytex;\n" "uniform sampler2D Utex;\n" "uniform sampler2D Vtex;\n" "uniform float in_bitdepth_factor;\n" "uniform float out_width;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_YUY2_UYVY_pack, glsl_func_fetch_planar_yuv, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+/* v210 layout (produces 6 pixels):
+ * U Y V X | Y U Y X | V Y U X | Y V Y X
+ */
+
+static const char glsl_func_v210_unpack[] =
+    "ivec2 v210_component_to_texel(int comp) {\n"
+    // (the texel index in the row, the swizzle index in that texel)
+    "  return ivec2(comp / 3, comp % 3);\n"
+    "}\n"
+    "ivec2 v210_y_xoffset(int xpos) {\n"
+    // 1 3 5 7 9 ...
+    "  int texel_i = xpos * 2 + 1;\n"
+    "  return v210_component_to_texel(texel_i);\n"
+    "}\n"
+    "ivec2 v210_u_xoffset(int xpos) {\n"
+    // 0 0 4 4 8 8 12 12 ...
+    "  int texel_i = 4 * (xpos / 2);\n"
+    "  return v210_component_to_texel(texel_i);\n"
+    "}\n"
+    "ivec2 v210_v_xoffset(int xpos) {\n"
+    // 2 2 6 6 10 10 14 14 ...
+    "  int texel_i = 4 * (xpos / 2) + 2;\n"
+    "  return v210_component_to_texel(texel_i);\n"
+    "}\n"
+    "vec4 v210_unpack(sampler2D tex, vec2 v_texcoord, vec2 vert_to_tex, vec2 chroma_sampling) {\n"
+    "  int xpos = int(v_texcoord.x * out_width);\n"
+    "  ivec2 y_xoffset = v210_y_xoffset(xpos);\n"
+    "  ivec2 u_xoffset = v210_u_xoffset(xpos * int(chroma_sampling.x));\n"
+    "  ivec2 v_xoffset = v210_v_xoffset(xpos * int(chroma_sampling.x));\n"
+    "  vec2 half_x_offset = vec2(poffset_x / 2.0, 0.0);\n"
+    "  vec4 y_texel = texture2D(tex, vec2(poffset_x * float(y_xoffset[0]), v_texcoord.y * vert_to_tex.y) * tex_scale0 + half_x_offset);\n"
+    "  vec4 u_texel = texture2D(tex, vec2(poffset_x * float(u_xoffset[0]), v_texcoord.y * vert_to_tex.y * chroma_sampling.y) * tex_scale0 + half_x_offset);\n"
+    "  vec4 v_texel = texture2D(tex, vec2(poffset_x * float(v_xoffset[0]), v_texcoord.y * vert_to_tex.y * chroma_sampling.y) * tex_scale0 + half_x_offset);\n"
+    "  return vec4(y_texel[y_xoffset[1]], u_texel[u_xoffset[1]], v_texel[v_xoffset[1]], 1.0);\n"
+    "}\n";
+
+static const gchar templ_v210_to_RGB_BODY[] =
+    "vec4 yuva = v210_unpack(Ytex, v_texcoord, vert_to_tex, vec2(1.0));\n"
+    "vec4 rgba = color_matrix_apply(yuva, to_RGB_matrix);\n"
+    "gl_FragColor = swizzle(rgba, output_swizzle);\n";
+
+static const struct shader_templ templ_v210_to_RGB =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex;\n" "uniform float out_width;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_v210_unpack, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar templ_v210_to_PLANAR_YUV_BODY[] =
+    "vec4 yuva = v210_unpack(Ytex, v_texcoord, vert_to_tex, chroma_sampling);\n"
+    "yuva = swizzle(yuva, output_swizzle) * out_bitdepth_factor;\n"
+    "write_planar_yuv(yuva);\n";
+
+static const struct shader_templ templ_v210_to_PLANAR_YUV =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex;\n" "uniform float out_width;\n" "uniform float out_bitdepth_factor;\n" "uniform vec2 chroma_sampling;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_v210_unpack, glsl_func_write_planar_yuv, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar templ_v210_to_PLANAR_YUVA_BODY[] =
+    "vec4 yuva = v210_unpack(Ytex, v_texcoord, vert_to_tex, chroma_sampling);\n"
+    "yuva = swizzle(yuva, output_swizzle) * out_bitdepth_factor;\n"
+    "write_planar_yuva(yuva);\n";
+
+static const struct shader_templ templ_v210_to_PLANAR_YUVA =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex;\n" "uniform float out_width;\n" "uniform float out_bitdepth_factor;\n" "uniform vec2 chroma_sampling;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_v210_unpack, glsl_func_write_planar_yuva, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const char glsl_func_v210_pack[] =
+    // UYV YUY VYU YVY
+    "ivec3 v210_pack(vec2 texcoord, vec2 vert_to_tex, out vec2 texcoord0, out vec2 texcoord1, out vec2 texcoord2) {\n"
+    // (texel index, component of the texel)
+    // array initialisation is not available in GLES2 so we construct it
+    // manually.
+    "  ivec2[12] block_indices;\n"
+    "  block_indices[0] = ivec2(0, 1);\n"
+    "  block_indices[1] = ivec2(0, 0);\n"
+    "  block_indices[2] = ivec2(0, 2);\n"
+    "  block_indices[3] = ivec2(1, 0);\n"
+    "  block_indices[4] = ivec2(2, 1);\n"
+    "  block_indices[5] = ivec2(2, 0);\n"
+    "  block_indices[6] = ivec2(2, 2);\n"
+    "  block_indices[7] = ivec2(3, 0);\n"
+    "  block_indices[8] = ivec2(4, 1);\n"
+    "  block_indices[9] = ivec2(4, 0);\n"
+    "  block_indices[10] = ivec2(4, 2);\n"
+    "  block_indices[11] = ivec2(5, 0);\n"
+    // poffset_x is in display width coordinates, not data width which is a
+    // factor of 2/3 (4/6) different
+    "  vec2 half_x_offset = vec2(poffset_x * 0.66666 / 2.0, 0.0);\n"
+    "  int xpos = int(texcoord.x * out_width);\n"
+    "  ivec2 sub_idx0 = block_indices[(xpos % 4) * 3 + 0];\n"
+    "  ivec2 sub_idx1 = block_indices[(xpos % 4) * 3 + 1];\n"
+    "  ivec2 sub_idx2 = block_indices[(xpos % 4) * 3 + 2];\n"
+    "  vec2 block_offset = vec2(float((xpos / 4) * 6) * poffset_x, texcoord.y * vert_to_tex.y) + half_x_offset;\n"
+    "  texcoord0 = block_offset + vec2(float(sub_idx0[0]) * poffset_x, 0.0);\n"
+    "  texcoord1 = block_offset + vec2(float(sub_idx1[0]) * poffset_x, 0.0);\n"
+    "  texcoord2 = block_offset + vec2(float(sub_idx2[0]) * poffset_x, 0.0);\n"
+    "  return ivec3(sub_idx0[1], sub_idx1[1], sub_idx2[1]);\n"
+    "}\n";
+
+static const gchar templ_PLANAR_YUV_to_v210_BODY[] =
+    "vec2 texcoord0, texcoord1, texcoord2;\n"
+    "ivec3 idx = v210_pack(v_texcoord, vert_to_tex, texcoord0, texcoord1, texcoord2);\n"
+    "vec4 yuva0 = fetch_planar_yuv(Ytex, Utex, Vtex, texcoord0);\n"
+    "vec4 yuva1 = fetch_planar_yuv(Ytex, Utex, Vtex, texcoord1);\n"
+    "vec4 yuva2 = fetch_planar_yuv(Ytex, Utex, Vtex, texcoord2);\n"
+    "gl_FragColor = vec4(yuva0[idx[0]], yuva1[idx[1]], yuva2[idx[2]], 1.0);\n";
+
+static const struct shader_templ templ_PLANAR_YUV_to_v210 =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D Ytex;\n" "uniform sampler2D Utex;\n" "uniform sampler2D Vtex;\n" "uniform float out_width;\n" "uniform float in_bitdepth_factor;\n" "uniform vec2 chroma_sampling;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_fetch_planar_yuv, glsl_func_v210_pack, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar templ_RGB_to_v210_BODY[] =
+    "vec2 texcoord0, texcoord1, texcoord2;\n"
+    "ivec3 idx = v210_pack(v_texcoord, vert_to_tex, texcoord0, texcoord1, texcoord2);\n"
+    "vec4 rgba0 = swizzle(texture2D(tex, texcoord0), input_swizzle);\n"
+    "vec4 rgba1 = swizzle(texture2D(tex, texcoord1), input_swizzle);\n"
+    "vec4 rgba2 = swizzle(texture2D(tex, texcoord2), input_swizzle);\n"
+    "vec4 yuva0 = color_matrix_apply(rgba0, to_YUV_matrix);\n"
+    "vec4 yuva1 = color_matrix_apply(rgba1, to_YUV_matrix);\n"
+    "vec4 yuva2 = color_matrix_apply(rgba2, to_YUV_matrix);\n"
+    "gl_FragColor = vec4(yuva0[idx[0]], yuva1[idx[1]], yuva2[idx[2]], 1.0);\n";
+
+static const struct shader_templ templ_RGB_to_v210 =
+  { NULL,
+    DEFAULT_UNIFORMS RGB_TO_YUV_COEFFICIENTS "uniform sampler2D tex;\n" "uniform float out_width;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_v210_pack, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar templ_YUY2_UYVY_to_v210_BODY[] =
+    "vec2 texcoord0, texcoord1, texcoord2;\n"
+    "ivec3 idx = v210_pack(v_texcoord, vert_to_tex, texcoord0, texcoord1, texcoord2);\n"
+    "vec4 yuva0 = yuy2_uyvy_unpack(tex, texcoord0 / vert_to_tex, vert_to_tex, vec2(1.0));\n"
+    "vec4 yuva1 = yuy2_uyvy_unpack(tex, texcoord1 / vert_to_tex, vert_to_tex, vec2(1.0));\n"
+    "vec4 yuva2 = yuy2_uyvy_unpack(tex, texcoord2 / vert_to_tex, vert_to_tex, vec2(1.0));\n"
+    "gl_FragColor = vec4(yuva0[idx[0]], yuva1[idx[1]], yuva2[idx[2]], 1.0);\n";
+
+static const struct shader_templ templ_YUY2_UYVY_to_v210 =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D tex;\n" "uniform float out_width;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_YUY2_UYVY_unpack, glsl_func_v210_pack, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar templ_v210_to_YUY2_UYVY_BODY[] =
+    "vec4 yuva = v210_unpack(tex, v_texcoord, vert_to_tex, vec2(1.0));\n"
+    "vec2 texcoord0, texcoord1;\n"
+    "ivec2 idx = YUY2_UYVY_pack(texcoord, v_texcoord, texcoord0, texcoord1);\n"
+    "gl_FragColor = vec4(yuva[idx[0]], yuva[idx[1]], 0.0, 0.0);\n";
+
+static const struct shader_templ templ_v210_to_YUY2_UYVY =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D tex;\n" "uniform float out_width;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_v210_unpack, glsl_func_YUY2_UYVY_pack, NULL, },
+    GST_GL_TEXTURE_TARGET_2D
+  };
+
+static const gchar templ_YUY2_UYVY_to_YUY2_UYVY_BODY[] =
+    "vec4 yuva = yuy2_uyvy_unpack(tex, v_texcoord, vert_to_tex, vec2(1.0));\n"
+    "vec2 texcoord0, texcoord1;\n"
+    "ivec2 idx = YUY2_UYVY_pack(texcoord, v_texcoord, texcoord0, texcoord1);\n"
+    "gl_FragColor = vec4(yuva[idx[0]], yuva[idx[1]], 0.0, 0.0);\n";
+
+static const struct shader_templ templ_YUY2_UYVY_to_YUY2_UYVY =
+  { NULL,
+    DEFAULT_UNIFORMS YUV_TO_RGB_COEFFICIENTS "uniform sampler2D tex;\n" "uniform float out_width;\n" "uniform vec2 vert_to_tex;\n",
+    { glsl_func_swizzle, glsl_func_color_matrix, glsl_func_YUY2_UYVY_unpack, glsl_func_YUY2_UYVY_pack, NULL, },
     GST_GL_TEXTURE_TARGET_2D
   };
 
@@ -1114,23 +1350,34 @@ _gst_gl_color_convert_can_passthrough_info (const GstVideoInfo * in,
 }
 
 static gboolean
+supports_yuv_yuv_conversion (const GstVideoFormatInfo * from)
+{
+  if (GST_VIDEO_FORMAT_INFO_IS_YUV (from)
+      && GST_VIDEO_FORMAT_INFO_N_PLANES (from) ==
+      GST_VIDEO_FORMAT_INFO_N_COMPONENTS (from))
+    return TRUE;
+
+  if (GST_VIDEO_FORMAT_INFO_FORMAT (from) == GST_VIDEO_FORMAT_v210)
+    return TRUE;
+  if (GST_VIDEO_FORMAT_INFO_FORMAT (from) == GST_VIDEO_FORMAT_UYVY)
+    return TRUE;
+  if (GST_VIDEO_FORMAT_INFO_FORMAT (from) == GST_VIDEO_FORMAT_YUY2)
+    return TRUE;
+
+  return FALSE;
+}
+
+static gboolean
 conversion_formats_are_supported (const GstVideoFormatInfo * in_finfo,
     const GstVideoFormatInfo * out_finfo)
 {
-  gboolean input_yuv_planar = GST_VIDEO_FORMAT_INFO_IS_YUV (in_finfo)
-      && GST_VIDEO_FORMAT_INFO_N_PLANES (in_finfo) ==
-      GST_VIDEO_FORMAT_INFO_N_COMPONENTS (in_finfo);
-  gboolean output_yuv_planar = GST_VIDEO_FORMAT_INFO_IS_YUV (out_finfo)
-      && GST_VIDEO_FORMAT_INFO_N_PLANES (out_finfo) ==
-      GST_VIDEO_FORMAT_INFO_N_COMPONENTS (out_finfo);
-
-  /* GRAY/YUV -> GRAY/YUV is not supported for non-passthrough */
   if (GST_VIDEO_FORMAT_INFO_IS_RGB (in_finfo))
     return TRUE;
   if (GST_VIDEO_FORMAT_INFO_IS_RGB (out_finfo))
     return TRUE;
 
-  if (input_yuv_planar && output_yuv_planar)
+  if (supports_yuv_yuv_conversion (in_finfo)
+      && supports_yuv_yuv_conversion (out_finfo))
     return TRUE;
 
   return FALSE;
@@ -1427,7 +1674,7 @@ _init_supported_formats (GstGLContext * context, gboolean output,
   if (!context || gst_gl_format_is_supported (context, GST_GL_RGB10_A2)) {
 #if G_BYTE_ORDER == G_LITTLE_ENDIAN
     _append_value_string_list (supported_formats, "BGR10A2_LE", "RGB10A2_LE",
-        "Y410", NULL);
+        "Y410", "v210", NULL);
 #else
     _append_value_string_list (supported_formats, "Y410", NULL);
 #endif
@@ -1511,7 +1758,8 @@ gst_gl_color_convert_caps_transform_format_info (GstGLContext * context,
       "A444_12LE", "A422_12LE", "A420_12LE", "A444_16LE", "A422_16LE",
       "A420_16LE", "I420_12LE", "I420_10LE", "A420_10BE", "A422_10BE",
       "A444_10BE", "A444_12BE", "A422_12BE", "A420_12BE", "A444_16BE",
-      "A422_16BE", "A420_16BE", "I420_12BE", "I420_10BE", NULL);
+      "A422_16BE", "A420_16BE", "I420_12BE", "I420_10BE", "v210", "UYVY",
+      "YUY2", NULL);
   _init_supported_formats (context, output, &supported_formats);
   gst_value_intersect (&supported_rgb_formats, &rgb_formats,
       &supported_formats);
@@ -1526,11 +1774,6 @@ gst_gl_color_convert_caps_transform_format_info (GstGLContext * context,
 
     st = gst_caps_get_structure (caps, i);
     f = gst_caps_get_features (caps, i);
-
-    /* If this is already expressed by the existing caps
-     * skip this structure */
-    if (i > 0 && gst_caps_is_subset_structure_full (res, st, f))
-      continue;
 
     format = gst_structure_get_value (st, "format");
     st = gst_structure_copy (st);
@@ -1562,9 +1805,7 @@ gst_gl_color_convert_caps_transform_format_info (GstGLContext * context,
                 GST_VIDEO_FORMAT_FLAG_RGB) {
               have_rgb_formats = TRUE;
               break;
-            } else if (GST_VIDEO_FORMAT_INFO_IS_YUV (t_info)
-                && GST_VIDEO_FORMAT_INFO_N_PLANES (t_info) ==
-                GST_VIDEO_FORMAT_INFO_N_COMPONENTS (t_info)) {
+            } else if (supports_yuv_yuv_conversion (t_info)) {
               have_planar_yuv_formats = TRUE;
             }
           }
@@ -1603,9 +1844,7 @@ gst_gl_color_convert_caps_transform_format_info (GstGLContext * context,
         } else {
           /* add passthrough structure, then the rgb conversion structure */
           gst_structure_set_value (st, "format", format);
-          if (GST_VIDEO_FORMAT_INFO_IS_YUV (t_info)
-              && GST_VIDEO_FORMAT_INFO_N_PLANES (t_info) ==
-              GST_VIDEO_FORMAT_INFO_N_COMPONENTS (t_info)) {
+          if (supports_yuv_yuv_conversion (t_info)) {
             gst_caps_append_structure_full (res, gst_structure_copy (st),
                 gst_caps_features_copy (f));
             gst_structure_set_value (st, "format",
@@ -1998,10 +2237,17 @@ video_format_to_gl_reorder (GstVideoFormat v_format, gint * reorder,
     gboolean input)
 {
   switch (v_format) {
+    case GST_VIDEO_FORMAT_v210:
+      /* complex, handled in shader */
+      reorder[0] = 0;
+      reorder[1] = 1;
+      reorder[2] = 2;
+      reorder[3] = 3;
+      break;
     case GST_VIDEO_FORMAT_UYVY:
       reorder[0] = 1;
       reorder[1] = 0;
-      reorder[2] = input ? 3 : 2;
+      reorder[2] = input ? 0 : 2;
       reorder[3] = 0;
       break;
     case GST_VIDEO_FORMAT_YUY2:
@@ -2010,8 +2256,8 @@ video_format_to_gl_reorder (GstVideoFormat v_format, gint * reorder,
     case GST_VIDEO_FORMAT_Y212_BE:
       reorder[0] = 0;
       reorder[1] = 1;
-      reorder[2] = 0;
-      reorder[3] = input ? 3 : 2;
+      reorder[2] = input ? 1 : 0;
+      reorder[3] = 2;
       break;
     case GST_VIDEO_FORMAT_GBR:
       if (input) {
@@ -2288,25 +2534,22 @@ _YUV_to_RGB (GstGLColorConvert * convert)
         break;
       case GST_VIDEO_FORMAT_YUY2:
       {
-        char uv_val =
-            convert->priv->in_tex_formats[0] ==
-            GST_GL_LUMINANCE_ALPHA ? 'a' : 'g';
+        if (convert->priv->in_tex_formats[0] == GST_GL_LUMINANCE_ALPHA) {
+          info->input_swizzle[1] = 3;
+          info->input_swizzle[2] = 3;
+        }
         info->templ = &templ_YUY2_UYVY_to_RGB;
-        info->frag_body =
-            g_strdup_printf (templ_YUY2_UYVY_to_RGB_BODY, 'r', uv_val, uv_val,
-            'g', 'a');
+        info->frag_body = g_strdup (templ_YUY2_UYVY_to_RGB_BODY);
         info->shader_tex_names[0] = "Ytex";
         break;
       }
       case GST_VIDEO_FORMAT_UYVY:
       {
-        char y_val =
-            convert->priv->in_tex_formats[0] ==
-            GST_GL_LUMINANCE_ALPHA ? 'a' : 'g';
+        if (convert->priv->in_tex_formats[0] == GST_GL_LUMINANCE_ALPHA) {
+          info->input_swizzle[0] = 3;
+        }
         info->templ = &templ_YUY2_UYVY_to_RGB;
-        info->frag_body =
-            g_strdup_printf (templ_YUY2_UYVY_to_RGB_BODY, y_val, 'g', 'g', 'r',
-            'b');
+        info->frag_body = g_strdup (templ_YUY2_UYVY_to_RGB_BODY);
         info->shader_tex_names[0] = "Ytex";
         break;
       }
@@ -2315,9 +2558,7 @@ _YUV_to_RGB (GstGLColorConvert * convert)
       case GST_VIDEO_FORMAT_Y212_BE:
       {
         info->templ = &templ_YUY2_UYVY_to_RGB;
-        info->frag_body =
-            g_strdup_printf (templ_YUY2_UYVY_to_RGB_BODY, 'r', 'g', 'g',
-            'g', 'a');
+        info->frag_body = g_strdup (templ_YUY2_UYVY_to_RGB_BODY);
         info->shader_tex_names[0] = "Ytex";
         break;
       }
@@ -2381,6 +2622,13 @@ _YUV_to_RGB (GstGLColorConvert * convert)
         info->shader_tex_names[1] = "UVtex";
         break;
       }
+      case GST_VIDEO_FORMAT_v210:
+      {
+        info->templ = &templ_v210_to_RGB;
+        info->frag_body = g_strdup (templ_v210_to_RGB_BODY);
+        info->shader_tex_names[0] = "Ytex";
+        break;
+      }
       default:
         break;
     }
@@ -2441,13 +2689,11 @@ _RGB_to_YUV (GstGLColorConvert * convert)
       case GST_VIDEO_FORMAT_Y212_LE:
       case GST_VIDEO_FORMAT_Y212_BE:
         info->templ = &templ_RGB_to_YUY2_UYVY;
-        info->frag_body = g_strdup_printf (templ_RGB_to_YUY2_UYVY_BODY,
-            'x', 'y', 'x', 'z');
+        info->frag_body = g_strdup (templ_RGB_to_YUY2_UYVY_BODY);
         break;
       case GST_VIDEO_FORMAT_UYVY:
         info->templ = &templ_RGB_to_YUY2_UYVY;
-        info->frag_body = g_strdup_printf (templ_RGB_to_YUY2_UYVY_BODY,
-            'y', 'x', 'z', 'x');
+        info->frag_body = g_strdup (templ_RGB_to_YUY2_UYVY_BODY);
         break;
       case GST_VIDEO_FORMAT_NV12:
       case GST_VIDEO_FORMAT_NV16:
@@ -2478,6 +2724,10 @@ _RGB_to_YUV (GstGLColorConvert * convert)
         } else {
           info->chroma_sampling[0] = info->chroma_sampling[1] = 2.0f;
         }
+        break;
+      case GST_VIDEO_FORMAT_v210:
+        info->templ = &templ_RGB_to_v210;
+        info->frag_body = g_strdup (templ_RGB_to_v210_BODY);
         break;
       default:
         break;
@@ -2554,8 +2804,104 @@ _YUV_to_YUV (GstGLColorConvert * convert)
         info->frag_body = g_strdup (templ_PLANAR_YUVA_to_PLANAR_YUVA_BODY);
       }
     }
+  } else if (input_planar) {
+    info->chroma_sampling[0] = (float) (1 << in_finfo->w_sub[1]);
+    info->chroma_sampling[1] = (float) (1 << in_finfo->h_sub[1]);
+    info->shader_tex_names[0] = "Ytex";
+    info->shader_tex_names[1] = "Utex";
+    info->shader_tex_names[2] = "Vtex";
+    info->in_bitdepth_factor =
+        (float) ((1 << GST_ROUND_UP_8 (in_finfo->bits)) -
+        1) / (float) ((1 << in_finfo->bits) - 1);
+    switch (out_format) {
+      case GST_VIDEO_FORMAT_v210:
+        info->templ = &templ_PLANAR_YUV_to_v210;
+        info->frag_body = g_strdup (templ_PLANAR_YUV_to_v210_BODY);
+        break;
+      case GST_VIDEO_FORMAT_UYVY:
+      case GST_VIDEO_FORMAT_YUY2:
+        info->templ = &templ_PLANAR_YUV_to_YUY2_UYVY;
+        info->frag_body = g_strdup (templ_PLANAR_YUV_to_YUY2_UYVY_BODY);
+        break;
+      default:
+        g_assert_not_reached ();
+        break;
+    }
+  } else if (output_planar) {
+    info->chroma_sampling[0] = (float) (1 << out_finfo->w_sub[1]);
+    info->chroma_sampling[1] = (float) (1 << out_finfo->h_sub[1]);
+    info->out_bitdepth_factor =
+        (float) ((1 << out_finfo->bits) -
+        1) / (float) ((1 << GST_ROUND_UP_8 (out_finfo->bits)) - 1);
+    switch (in_format) {
+      case GST_VIDEO_FORMAT_v210:
+        if (!GST_VIDEO_FORMAT_INFO_HAS_ALPHA (out_finfo)) {
+          info->templ = &templ_v210_to_PLANAR_YUV;
+          info->frag_body = g_strdup (templ_v210_to_PLANAR_YUV_BODY);
+        } else {
+          info->templ = &templ_v210_to_PLANAR_YUVA;
+          info->frag_body = g_strdup (templ_v210_to_PLANAR_YUVA_BODY);
+        }
+        break;
+      case GST_VIDEO_FORMAT_UYVY:
+      case GST_VIDEO_FORMAT_YUY2:
+        if (convert->priv->in_tex_formats[0] == GST_GL_LUMINANCE_ALPHA) {
+          if (in_format == GST_VIDEO_FORMAT_UYVY) {
+            info->input_swizzle[0] = 3;
+          } else if (in_format == GST_VIDEO_FORMAT_YUY2) {
+            info->input_swizzle[1] = 3;
+            info->input_swizzle[2] = 3;
+          }
+        }
+        if (!GST_VIDEO_FORMAT_INFO_HAS_ALPHA (out_finfo)) {
+          info->templ = &templ_YUY2_UYVY_to_PLANAR_YUV;
+          info->frag_body = g_strdup (templ_YUY2_UYVY_to_PLANAR_YUV_BODY);
+        } else {
+          info->templ = &templ_YUY2_UYVY_to_PLANAR_YUVA;
+          info->frag_body = g_strdup (templ_YUY2_UYVY_to_PLANAR_YUVA_BODY);
+        }
+        break;
+      default:
+        g_assert_not_reached ();
+        break;
+    }
   } else {
-    g_assert_not_reached ();
+    switch (in_format) {
+      case GST_VIDEO_FORMAT_UYVY:
+      case GST_VIDEO_FORMAT_YUY2:
+        info->shader_tex_names[0] = "tex";
+        switch (out_format) {
+          case GST_VIDEO_FORMAT_v210:
+            info->templ = &templ_YUY2_UYVY_to_v210;
+            info->frag_body = g_strdup (templ_YUY2_UYVY_to_v210_BODY);
+            break;
+          case GST_VIDEO_FORMAT_YUY2:
+          case GST_VIDEO_FORMAT_UYVY:
+            info->templ = &templ_YUY2_UYVY_to_YUY2_UYVY;
+            info->frag_body = g_strdup (templ_YUY2_UYVY_to_YUY2_UYVY_BODY);
+            break;
+          default:
+            g_assert_not_reached ();
+            break;
+        }
+        break;
+      case GST_VIDEO_FORMAT_v210:
+        info->shader_tex_names[0] = "tex";
+        switch (out_format) {
+          case GST_VIDEO_FORMAT_YUY2:
+          case GST_VIDEO_FORMAT_UYVY:
+            info->templ = &templ_v210_to_YUY2_UYVY;
+            info->frag_body = g_strdup (templ_v210_to_YUY2_UYVY_BODY);
+            break;
+          default:
+            g_assert_not_reached ();
+            break;
+        }
+        break;
+      default:
+        g_assert_not_reached ();
+        break;
+    }
   }
 }
 
@@ -2848,6 +3194,8 @@ _init_convert (GstGLColorConvert * convert)
 {
   GstGLFuncs *gl;
   struct ConvertInfo *info = &convert->priv->convert_info;
+  gsize input_data_width = GST_VIDEO_INFO_WIDTH (&convert->in_info);
+  gsize output_data_width = GST_VIDEO_INFO_WIDTH (&convert->out_info);
   gint i;
 
   gl = convert->context->gl_vtable;
@@ -2966,6 +3314,17 @@ _init_convert (GstGLColorConvert * convert)
           i);
   }
 
+  if (GST_VIDEO_INFO_FORMAT (&convert->in_info) == GST_VIDEO_FORMAT_v210) {
+    /* XXX: this may not work with strides larger than the minimum required, */
+    input_data_width = ((GST_VIDEO_INFO_WIDTH (&convert->in_info) + 5) / 6) * 4;
+  }
+
+  if (GST_VIDEO_INFO_FORMAT (&convert->out_info) == GST_VIDEO_FORMAT_v210) {
+    /* XXX: this may not work with strides larger than the minimum required, */
+    output_data_width =
+        ((GST_VIDEO_INFO_WIDTH (&convert->out_info) + 5) / 6) * 4;
+  }
+
   if (GST_VIDEO_FORMAT_INFO_IS_TILED (convert->in_info.finfo)) {
     guint tile_width, tile_height;
     gsize stride;
@@ -2981,20 +3340,27 @@ _init_convert (GstGLColorConvert * convert)
     gst_gl_shader_set_uniform_1f (convert->shader, "width", width);
     gst_gl_shader_set_uniform_1f (convert->shader, "height", height);
   } else {
-    gst_gl_shader_set_uniform_1f (convert->shader, "width",
-        GST_VIDEO_INFO_WIDTH (&convert->in_info));
+    gst_gl_shader_set_uniform_1f (convert->shader, "width", input_data_width);
     gst_gl_shader_set_uniform_1f (convert->shader, "height",
         GST_VIDEO_INFO_HEIGHT (&convert->in_info));
   }
+  gst_gl_shader_set_uniform_1f (convert->shader, "out_width",
+      output_data_width);
+  gst_gl_shader_set_uniform_1f (convert->shader, "out_height",
+      GST_VIDEO_INFO_HEIGHT (&convert->out_info));
 
   if (convert->priv->from_texture_target == GST_GL_TEXTURE_TARGET_RECTANGLE) {
     gst_gl_shader_set_uniform_1f (convert->shader, "poffset_x", 1.);
     gst_gl_shader_set_uniform_1f (convert->shader, "poffset_y", 1.);
+    gst_gl_shader_set_uniform_2f (convert->shader, "vert_to_tex",
+        (gfloat) input_data_width,
+        (gfloat) GST_VIDEO_INFO_HEIGHT (&convert->in_info));
   } else {
     gst_gl_shader_set_uniform_1f (convert->shader, "poffset_x",
-        1. / (gfloat) GST_VIDEO_INFO_WIDTH (&convert->in_info));
+        1. / (gfloat) input_data_width);
     gst_gl_shader_set_uniform_1f (convert->shader, "poffset_y",
         1. / (gfloat) GST_VIDEO_INFO_HEIGHT (&convert->in_info));
+    gst_gl_shader_set_uniform_2f (convert->shader, "vert_to_tex", 1., 1.);
   }
 
   if (info->chroma_sampling[0] > 0.0f && info->chroma_sampling[1] > 0.0f) {
@@ -3153,7 +3519,9 @@ _do_convert_one_view (GstGLContext * context, GstGLColorConvert * convert,
 
     if (out_tex->tex_format == GST_GL_LUMINANCE
         || out_tex->tex_format == GST_GL_LUMINANCE_ALPHA
-        || out_width != mem_width || out_height != mem_height) {
+        || out_height != mem_height
+        || (out_width != mem_width
+            && convert->out_info.finfo->format != GST_VIDEO_FORMAT_v210)) {
       /* Luminance formats are not color renderable */
       /* rendering to a framebuffer only renders the intersection of all
        * the attachments i.e. the smallest attachment size */
@@ -3225,7 +3593,9 @@ out:
 
     if (out_tex->tex_format == GST_GL_LUMINANCE
         || out_tex->tex_format == GST_GL_LUMINANCE_ALPHA
-        || out_width != mem_width || out_height != mem_height) {
+        || out_height != mem_height
+        || (out_width != mem_width
+            && convert->out_info.finfo->format != GST_VIDEO_FORMAT_v210)) {
       GstMapInfo to_info, from_info;
 
       if (!gst_memory_map ((GstMemory *) convert->priv->out_tex[j], &from_info,

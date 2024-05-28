@@ -3739,10 +3739,10 @@ the list should be skipped.</doc>
 You must make sure that @idx does not exceed the number of
 buffers available.</doc>
         <source-position filename="../subprojects/gstreamer/gst/gstbufferlist.h"/>
-        <return-value transfer-ownership="none" nullable="1">
-          <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstbufferlist.c">the buffer at @idx in @group
-    or %NULL when there is no buffer. The buffer remains valid as
-    long as @list is valid and buffer is not removed from the list.</doc>
+        <return-value transfer-ownership="none">
+          <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstbufferlist.c">the buffer at @idx in @group.
+    The returned buffer remains valid as long as @list is valid and
+    buffer is not removed from the list.</doc>
           <type name="Buffer" c:type="GstBuffer*"/>
         </return-value>
         <parameters>
@@ -3762,9 +3762,9 @@ buffers available.</doc>
 You must make sure that @idx does not exceed the number of
 buffers available.</doc>
         <source-position filename="../subprojects/gstreamer/gst/gstbufferlist.h"/>
-        <return-value transfer-ownership="none" nullable="1">
+        <return-value transfer-ownership="none">
           <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstbufferlist.c">the buffer at @idx in @group.
-    The returned  buffer remains valid as long as @list is valid and
+    The returned buffer remains valid as long as @list is valid and
     the buffer is not removed from the list.</doc>
           <type name="Buffer" c:type="GstBuffer*"/>
         </return-value>
@@ -43947,9 +43947,10 @@ printf("%" GST_TIME_FORMAT "\n", GST_TIME_ARGS(ts));
     <function-macro name="TIME_TO_TIMEVAL" c:identifier="GST_TIME_TO_TIMEVAL" introspectable="0">
       <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstclock.h">Converts a #GstClockTime to a GTimeVal
 
-&gt; on 32-bit systems, a timeval has a range of only 2^32 - 1 seconds,
-&gt; which is about 68 years.  Expect trouble if you want to schedule stuff
-&gt; in your pipeline for 2038.</doc>
+&gt; on many 32-bit systems, a timeval has a range of only 2^32 - 1 seconds,
+&gt; which is about 68 years. Expect trouble if you want to schedule stuff
+&gt; in your pipeline for 2038. This macro asserts that this case does not
+&gt; happen.</doc>
       <source-position filename="../subprojects/gstreamer/gst/gstclock.h"/>
       <parameters>
         <parameter name="t">
@@ -51547,6 +51548,47 @@ would write out.</doc>
         <parameter name="args" transfer-ownership="none">
           <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstinfo.c">optional arguments for the format</doc>
           <type name="va_list" c:type="va_list"/>
+        </parameter>
+      </parameters>
+    </function>
+    <function name="debug_print_object" c:identifier="gst_debug_print_object" version="1.26">
+      <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstinfo.c">Returns a string that represents @ptr. This is safe to call with
+%GstStructure, %GstCapsFeatures, %GstMiniObject s (e.g. %GstCaps,
+%GstBuffer or %GstMessage), and %GObjects (e.g. %GstElement or %GstPad).
+
+The string representation is meant to be used for debugging purposes and
+might change between GStreamer versions.
+
+Passing other kind of pointers might or might not work and is generally
+unsafe to do.</doc>
+      <source-position filename="../subprojects/gstreamer/gst/gstinfo.h"/>
+      <return-value transfer-ownership="full">
+        <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstinfo.c">a string containing a string
+    representation of the object</doc>
+        <type name="utf8" c:type="gchar*"/>
+      </return-value>
+      <parameters>
+        <parameter name="ptr" transfer-ownership="none" nullable="1" allow-none="1">
+          <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstinfo.c">the object</doc>
+          <type name="gpointer" c:type="gconstpointer"/>
+        </parameter>
+      </parameters>
+    </function>
+    <function name="debug_print_segment" c:identifier="gst_debug_print_segment" version="1.26">
+      <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstinfo.c">Returns a string that represents @segments.
+
+The string representation is meant to be used for debugging purposes and
+might change between GStreamer versions.</doc>
+      <source-position filename="../subprojects/gstreamer/gst/gstinfo.h"/>
+      <return-value transfer-ownership="full">
+        <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstinfo.c">a string containing a string
+    representation of the segment</doc>
+        <type name="utf8" c:type="gchar*"/>
+      </return-value>
+      <parameters>
+        <parameter name="segment" transfer-ownership="none" nullable="1" allow-none="1">
+          <doc xml:space="preserve" filename="../subprojects/gstreamer/gst/gstinfo.c">the %GstSegment</doc>
+          <type name="Segment" c:type="const GstSegment*"/>
         </parameter>
       </parameters>
     </function>

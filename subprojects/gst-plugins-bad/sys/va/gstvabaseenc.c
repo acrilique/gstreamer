@@ -32,6 +32,8 @@
 #define GST_CAT_DEFAULT gst_va_base_enc_debug
 GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 
+#define GST_FLOW_OUTPUT_NOT_READY GST_FLOW_CUSTOM_SUCCESS_2
+
 struct _GstVaBaseEncPrivate
 {
   GstVideoInfo sinkpad_info;
@@ -73,6 +75,8 @@ gst_va_base_enc_reset_state_default (GstVaBaseEnc * base)
   base->profile = VAProfileNone;
   base->rt_format = 0;
   base->codedbuf_size = 0;
+  base->preferred_output_delay = 0;
+  base->min_buffers = 1;
   g_atomic_int_set (&base->reconf, FALSE);
 }
 
@@ -414,7 +418,7 @@ gst_va_base_enc_propose_allocation (GstVideoEncoder * venc, GstQuery * query)
   if (!(allocator = _allocator_from_caps (base, caps)))
     return FALSE;
 
-  pool = gst_va_pool_new_with_config (caps, 1, 0, usage_hint,
+  pool = gst_va_pool_new_with_config (caps, base->min_buffers, 0, usage_hint,
       GST_VA_FEATURE_AUTO, allocator, &params);
   if (!pool) {
     gst_object_unref (allocator);
@@ -425,7 +429,7 @@ gst_va_base_enc_propose_allocation (GstVideoEncoder * venc, GstQuery * query)
     goto config_failed;
 
   gst_query_add_allocation_param (query, allocator, &params);
-  gst_query_add_allocation_pool (query, pool, size, 1, 0);
+  gst_query_add_allocation_pool (query, pool, size, base->min_buffers, 0);
 
   GST_DEBUG_OBJECT (base,
       "proposing %" GST_PTR_FORMAT " with allocator %" GST_PTR_FORMAT,
@@ -503,6 +507,33 @@ _push_out_one_buffer (GstVaBaseEnc * base)
   }
 
   return ret;
+}
+
+static GstFlowReturn
+_try_to_push_out_one_buffer (GstVaBaseEnc * base)
+{
+  GstVideoCodecFrame *frame_out;
+  GstVaEncFrame *frame_enc;
+  VASurfaceID surface;
+  gboolean ready;
+
+  frame_out = g_queue_peek_head (&base->output_list);
+  if (frame_out == NULL)
+    return GST_FLOW_OUTPUT_NOT_READY;
+
+  frame_enc = gst_va_get_enc_frame (frame_out);
+
+  surface = gst_va_encode_picture_get_reconstruct_surface (frame_enc->picture);
+
+  ready = va_check_surface_has_status (base->display, surface, VASurfaceReady);
+
+  GST_LOG_OBJECT (base, "Output of system_frame_number %d is %s",
+      frame_out->system_frame_number, ready ? "ready" : "not ready");
+
+  if (!ready)
+    return GST_FLOW_OUTPUT_NOT_READY;
+
+  return _push_out_one_buffer (base);
 }
 
 static GstFlowReturn
@@ -655,17 +686,41 @@ gst_va_base_enc_handle_frame (GstVideoEncoder * venc,
   /* pass it to reorder list and we should not use it again. */
   frame = NULL;
 
-  while (frame_encode) {
-    ret = base_class->encode_frame (base, frame_encode, FALSE);
+  if (frame_encode) {
+    while (frame_encode) {
+      ret = base_class->encode_frame (base, frame_encode, FALSE);
+      if (ret != GST_FLOW_OK)
+        goto error_encode;
+
+      while (ret == GST_FLOW_OK && g_queue_get_length (&base->output_list) >
+          base->preferred_output_delay)
+        ret = _push_out_one_buffer (base);
+
+      if (ret != GST_FLOW_OK)
+        goto error_push_buffer;
+
+      /* Try to push out all ready frames. */
+      do {
+        ret = _try_to_push_out_one_buffer (base);
+      } while (ret == GST_FLOW_OK);
+      if (ret == GST_FLOW_OUTPUT_NOT_READY)
+        ret = GST_FLOW_OK;
+      if (ret != GST_FLOW_OK)
+        goto error_push_buffer;
+
+      frame_encode = NULL;
+      if (!base_class->reorder_frame (base, NULL, FALSE, &frame_encode))
+        goto error_reorder;
+    }
+  } else {
+    /* Try to push out all ready frames. */
+    do {
+      ret = _try_to_push_out_one_buffer (base);
+    } while (ret == GST_FLOW_OK);
+    if (ret == GST_FLOW_OUTPUT_NOT_READY)
+      ret = GST_FLOW_OK;
     if (ret != GST_FLOW_OK)
-      goto error_encode;
-
-    while (g_queue_get_length (&base->output_list) > 0)
-      ret = _push_out_one_buffer (base);
-
-    frame_encode = NULL;
-    if (!base_class->reorder_frame (base, NULL, FALSE, &frame_encode))
-      goto error_reorder;
+      goto error_push_buffer;
   }
 
   return ret;
@@ -706,6 +761,12 @@ error_encode:
     gst_video_encoder_finish_frame (venc, frame_encode);
     return ret;
   }
+error_push_buffer:
+  {
+    GST_ELEMENT_ERROR (venc, STREAM, ENCODE,
+        ("Failed to push one frame."), (NULL));
+    return ret;
+  }
 }
 
 static GstFlowReturn
@@ -718,6 +779,7 @@ static gboolean
 gst_va_base_enc_set_format (GstVideoEncoder * venc, GstVideoCodecState * state)
 {
   GstVaBaseEnc *base = GST_VA_BASE_ENC (venc);
+  GstQuery *query;
 
   g_return_val_if_fail (state->caps != NULL, FALSE);
 
@@ -737,6 +799,13 @@ gst_va_base_enc_set_format (GstVideoEncoder * venc, GstVideoCodecState * state)
   if (base->input_state)
     gst_video_codec_state_unref (base->input_state);
   base->input_state = gst_video_codec_state_ref (state);
+
+  /* in case live streaming, we should run on low-latency mode */
+  base->is_live = FALSE;
+  query = gst_query_new_latency ();
+  if (gst_pad_peer_query (GST_VIDEO_ENCODER_SINK_PAD (venc), query))
+    gst_query_parse_latency (query, &base->is_live, NULL, NULL);
+  gst_query_unref (query);
 
   if (!gst_va_base_enc_reset (base))
     return FALSE;
@@ -890,6 +959,7 @@ gst_va_base_enc_init (GstVaBaseEnc * self)
   g_queue_init (&self->ref_list);
   g_queue_init (&self->output_list);
   gst_video_info_init (&self->in_info);
+  self->min_buffers = 1;
 
   self->dts_queue = gst_vec_deque_new_for_struct (sizeof (GstClockTime), 8);
 
