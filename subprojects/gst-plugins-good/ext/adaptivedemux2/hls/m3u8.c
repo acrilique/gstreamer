@@ -417,7 +417,7 @@ gst_hls_media_playlist_new (const gchar * uri, const gchar * base_uri)
   m3u8->targetduration = GST_CLOCK_TIME_NONE;
   m3u8->partial_targetduration = GST_CLOCK_TIME_NONE;
   m3u8->media_sequence = 0;
-  m3u8->discont_sequence = 0;
+  m3u8->discont_sequence = -1;
   m3u8->endlist = FALSE;
   m3u8->i_frame = FALSE;
   m3u8->allowcache = TRUE;
@@ -1243,6 +1243,9 @@ gst_hls_media_playlist_parse (gchar * data,
     return NULL;
   }
 
+  if (!self->has_ext_x_dsn)
+    self->discont_sequence = 0;
+
   /* Now go over the parsed data to ensure MSN and/or PDT are set */
   if (self->ext_x_pdt_present)
     gst_hls_media_playlist_postprocess_pdt (self);
@@ -1873,15 +1876,24 @@ find_segment_in_playlist (GstHLSMediaPlaylist * playlist,
         }
       }
 
-      if (cand->datetime
-          && g_date_time_difference (cand->datetime, segment->datetime) >= 0) {
+      /* The reported PDT might not be 100% identical for matching segments
+       * across playlists, we therefore need to take into account a certain
+       * tolerance otherwise we would fail to match candidates with a PDT which
+       * is slightly before. We therefore check whether the segment starts
+       * within the first third of the candidate segment.
+       */
+      if (cand->datetime) {
+        GstClockTimeDiff pdtdiff = g_date_time_difference (cand->datetime,
+            segment->datetime) * GST_USECOND + cand->duration / 3;
+        if (pdtdiff >= 0) {
 #ifndef GST_DISABLE_GST_DEBUG
-        gchar *pdtstring = g_date_time_format_iso8601 (cand->datetime);
-        GST_DEBUG ("Picking segment with datetime %s", pdtstring);
-        g_free (pdtstring);
+          gchar *pdtstring = g_date_time_format_iso8601 (cand->datetime);
+          GST_DEBUG ("Picking segment with datetime %s", pdtstring);
+          g_free (pdtstring);
 #endif
-        *matched_pdt = TRUE;
-        return cand;
+          *matched_pdt = TRUE;
+          return cand;
+        }
       }
     }
   }
@@ -2098,6 +2110,10 @@ gst_hls_media_playlist_get_starting_segment (GstHLSMediaPlaylist * self,
     res = g_ptr_array_index (self->segments, 0);
   } else {
     GstClockTime hold_back = GST_CLOCK_TIME_NONE;
+    GstM3U8MediaSegment *last_seg;
+    g_assert (self->segments->len);
+    last_seg = g_ptr_array_index (self->segments, self->segments->len - 1);
+
     /* Live playlist. If low-latency, use the PART-HOLD-BACK specified distance
      * from the end, otherwise HOLD-BACK distance */
     if (GST_CLOCK_TIME_IS_VALID (self->part_hold_back))
@@ -2123,12 +2139,11 @@ gst_hls_media_playlist_get_starting_segment (GstHLSMediaPlaylist * self,
       hold_back = GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE * self->targetduration;
     }
 
-    if (GST_CLOCK_TIME_IS_VALID (hold_back)) {
+    if (GST_CLOCK_TIME_IS_VALID (hold_back)
+        && GST_CLOCK_STIME_IS_VALID (last_seg->stream_time)) {
       GstSeekFlags flags =
           GST_SEEK_FLAG_SNAP_BEFORE | GST_SEEK_FLAG_KEY_UNIT |
           GST_HLS_M3U8_SEEK_FLAG_ALLOW_PARTIAL;
-      GstM3U8MediaSegment *last_seg =
-          g_ptr_array_index (self->segments, self->segments->len - 1);
       GstClockTime playlist_duration =
           last_seg->stream_time + last_seg->duration;
       GstClockTime target_ts;
@@ -2186,16 +2201,24 @@ gst_hls_media_playlist_get_starting_segment (GstHLSMediaPlaylist * self,
  * This should be used when a reference media segment couldn't be matched in the
  * playlist, but we still want to carry over the information from a reference
  * playlist to an updated one. This can happen with live playlists where the
- * reference media segment is no longer present but the playlists intersect */
+ * reference media segment is no longer present but the playlists intersect
+ *
+ * If the sync is sucessfull, discont will be set to TRUE if it was a perfect
+ * URI fragment match, else it will be FALSE (ex: match was done on PDT or
+ * SN/DSN).
+ **/
 gboolean
 gst_hls_media_playlist_sync_to_playlist (GstHLSMediaPlaylist * playlist,
-    GstHLSMediaPlaylist * reference)
+    GstHLSMediaPlaylist * reference, gboolean * discont)
 {
   GstM3U8MediaSegment *res = NULL;
   GstM3U8MediaSegment *cand = NULL;
   guint idx;
   gboolean is_before;
   gboolean matched_pdt = FALSE;
+
+  if (discont)
+    *discont = FALSE;
 
   g_return_val_if_fail (playlist && reference, FALSE);
 
@@ -2224,6 +2247,13 @@ retry_without_dsn:
     }
     GST_WARNING ("Could not synchronize media playlists");
     return FALSE;
+  }
+
+  if (discont) {
+    /* If not a perfect match, mark as such */
+    GST_DEBUG ("Checking match uri cand: %s", cand->uri);
+    GST_DEBUG ("Checking match uri res : %s", res->uri);
+    *discont = g_strcmp0 (res->uri, cand->uri) != 0;
   }
 
   /* Carry over reference stream time */

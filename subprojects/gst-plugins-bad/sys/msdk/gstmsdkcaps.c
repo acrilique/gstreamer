@@ -32,7 +32,7 @@
 #include "gstmsdkcaps.h"
 
 #ifndef _WIN32
-#include <libdrm/drm_fourcc.h>
+#include <drm_fourcc.h>
 #include <gst/video/video-info-dma.h>
 #include "gstmsdkallocator_libva.h"
 #include <gst/va/gstvavideoformat.h>
@@ -1777,7 +1777,7 @@ _dec_get_static_dma_formats (guint codec_id)
     case MFX_CODEC_AVC:
       return "NV12, BGRA, BGRx";
     case MFX_CODEC_HEVC:
-      return "NV12, P010_10LE, YUY2, Y210,  VUYA, Y410, P012_LE, "
+      return "NV12, P010_10LE, YUY2, Y210, VUYA, Y410, P012_LE, "
           "Y212_LE, Y412_LE, BGRA, BGRx";
     case MFX_CODEC_MPEG2:
       return "NV12";
