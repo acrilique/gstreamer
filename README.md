@@ -5,6 +5,7 @@ This is a fork of GStreamer with just one change. The mpegtsdemux module has new
  - PTS_RAW1
  - PTS_RAW2
  - URL_PATH
+
 The mpegtsdemux plugin now parses TEMI location and TEMI timestamp fields on the MPEG TS header and saves the contents to the properties above. This allows us to retreive from the video content an url to related content and timestamps.
 
 We try to keep this fork in sync with the official GStreamer GitHub repository, at least once every two weeks.
