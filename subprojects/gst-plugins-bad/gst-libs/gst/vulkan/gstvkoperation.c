@@ -1202,8 +1202,10 @@ gst_vulkan_operation_enable_query (GstVulkanOperation * self,
     VkQueryType query_type, guint n_queries, gpointer pnext, GError ** error)
 {
   GstVulkanOperationPrivate *priv;
+#if GST_VULKAN_HAVE_VIDEO_EXTENSIONS
   GstVulkanPhysicalDevice *device;
   guint32 queue_family;
+#endif
   VkQueryPoolCreateInfo query_pool_info = {
     .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
     .pNext = pnext,
@@ -1221,14 +1223,24 @@ gst_vulkan_operation_enable_query (GstVulkanOperation * self,
   if (priv->query_pool)
     return TRUE;
 
+#if GST_VULKAN_HAVE_VIDEO_EXTENSIONS
   queue_family = priv->cmd_pool->queue->family;
   device = priv->cmd_pool->queue->device->physical_device;
-  if (!device->queue_family_ops[queue_family].query) {
+  /*
+   * The VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR can be optional, so .query_result_status
+   * can be FALSE, see AMD's case.
+   * vkCreateQueryPool needs to be called when the query is
+   * VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR to enable it anyway.
+   */
+  if (!device->queue_family_ops[queue_family].query_result_status &&
+      query_type == VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR) {
     g_set_error (error, GST_VULKAN_ERROR, VK_ERROR_FEATURE_NOT_PRESENT,
-        "Queue %" GST_PTR_FORMAT " doesn't support query operations",
+        "Queue %" GST_PTR_FORMAT
+        " doesn't support result status query operations",
         priv->cmd_pool->queue);
     return FALSE;
   }
+#endif
 
   res = vkCreateQueryPool (priv->cmd_pool->queue->device->device,
       &query_pool_info, NULL, &priv->query_pool);
@@ -1249,12 +1261,10 @@ gst_vulkan_operation_enable_query (GstVulkanOperation * self,
       if (priv->has_video)
         stride = sizeof (guint32);
       break;
-#if GST_VULKAN_HAVE_VIDEO_ENCODERS
     case VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR:
       if (priv->has_video)
         stride = sizeof (GstVulkanEncodeQueryResult);
       break;
-#endif
 #endif
 
     default:
@@ -1299,10 +1309,7 @@ gst_vulkan_operation_get_query (GstVulkanOperation * self, gpointer * result,
 #if GST_VULKAN_HAVE_VIDEO_EXTENSIONS
   if (priv->has_video
       && (priv->query_type == VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR
-#if GST_VULKAN_HAVE_VIDEO_ENCODERS
-          || priv->query_type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR
-#endif
-      )) {
+          || priv->query_type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR)) {
     flags |= VK_QUERY_RESULT_WITH_STATUS_BIT_KHR;
   }
 #endif

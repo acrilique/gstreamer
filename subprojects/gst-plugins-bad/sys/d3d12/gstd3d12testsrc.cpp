@@ -1577,11 +1577,18 @@ gst_d3d12_test_src_setup_context (GstD3D12TestSrc * self, GstCaps * caps)
 
   gst_video_info_set_format (&draw_info, GST_VIDEO_FORMAT_BGRA,
       priv->info.width, priv->info.height);
-  ctx->conv = gst_d3d12_converter_new (self->device,
+  ctx->conv = gst_d3d12_converter_new (self->device, nullptr,
       &draw_info, &priv->info, nullptr, nullptr, config);
 
   if (!ctx->conv) {
     GST_ERROR_OBJECT (self, "Failed to create converter");
+    return FALSE;
+  }
+
+  GstD3D12Format device_format;
+  if (!gst_d3d12_device_get_format (self->device,
+          GST_VIDEO_INFO_FORMAT (&priv->info), &device_format)) {
+    GST_ERROR_OBJECT (self, "Couldn't get device foramt");
     return FALSE;
   }
 
@@ -1656,10 +1663,20 @@ gst_d3d12_test_src_setup_context (GstD3D12TestSrc * self, GstCaps * caps)
     ctx->convert_pool = gst_d3d12_buffer_pool_new (self->device);
     config = gst_buffer_pool_get_config (ctx->convert_pool);
     gst_buffer_pool_config_set_params (config, caps, priv->info.size, 0, 0);
+
+    D3D12_RESOURCE_FLAGS resource_flags =
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+
+    if ((device_format.format_flags & GST_D3D12_FORMAT_FLAG_OUTPUT_UAV)
+        == GST_D3D12_FORMAT_FLAG_OUTPUT_UAV) {
+      resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    } else {
+      resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    }
+
     auto params = gst_d3d12_allocation_params_new (self->device, &priv->info,
-        GST_D3D12_ALLOCATION_FLAG_DEFAULT,
-        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, D3D12_HEAP_FLAG_NONE);
+        GST_D3D12_ALLOCATION_FLAG_DEFAULT, resource_flags,
+        D3D12_HEAP_FLAG_NONE);
     gst_buffer_pool_config_set_d3d12_allocation_params (config, params);
     gst_d3d12_allocation_params_free (params);
 
@@ -1810,6 +1827,13 @@ gst_d3d12_test_src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
 
   gst_video_info_from_caps (&vinfo, caps);
 
+  GstD3D12Format device_format;
+  if (!gst_d3d12_device_get_format (self->device,
+          GST_VIDEO_INFO_FORMAT (&vinfo), &device_format)) {
+    GST_ERROR_OBJECT (self, "Couldn't get device foramt");
+    return FALSE;
+  }
+
   if (gst_query_get_n_allocation_pools (query) > 0) {
     gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
     update_pool = TRUE;
@@ -1844,8 +1868,13 @@ gst_d3d12_test_src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
 
   if (priv->downstream_supports_d3d12) {
     D3D12_RESOURCE_FLAGS resource_flags =
-        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
-        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    if ((device_format.format_flags & GST_D3D12_FORMAT_FLAG_OUTPUT_UAV)
+        == GST_D3D12_FORMAT_FLAG_OUTPUT_UAV) {
+      resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    } else {
+      resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    }
 
     auto params = gst_buffer_pool_config_get_d3d12_allocation_params (config);
     if (!params) {
@@ -2197,14 +2226,13 @@ gst_d3d12_test_src_create (GstBaseSrc * bsrc, guint64 offset,
   auto cl = priv->ctx->cl;
   GstD3D12FenceData *fence_data;
   gst_d3d12_fence_data_pool_acquire (priv->fence_data_pool, &fence_data);
-  gst_d3d12_fence_data_add_notify_mini_object (fence_data, gst_ca);
+  gst_d3d12_fence_data_push (fence_data, FENCE_NOTIFY_MINI_OBJECT (gst_ca));
 
   pts = priv->accum_rtime + priv->running_time;
   gst_d3d12_test_src_draw_pattern (self, pts, cl.Get ());
-
   if (!gst_d3d12_converter_convert_buffer (priv->ctx->conv,
           priv->ctx->render_buffer, convert_buffer, fence_data, cl.Get (),
-          nullptr)) {
+          FALSE)) {
     GST_ERROR_OBJECT (self, "Couldn't build convert command");
     gst_clear_buffer (&convert_buffer);
     gst_d3d12_fence_data_unref (fence_data);
@@ -2222,17 +2250,21 @@ gst_d3d12_test_src_create (GstBaseSrc * bsrc, guint64 offset,
 
   ID3D12CommandList *cmd_list[] = { priv->ctx->cl.Get () };
 
-  if (!gst_d3d12_device_execute_command_lists (self->device,
-          D3D12_COMMAND_LIST_TYPE_DIRECT, 1, cmd_list, &priv->ctx->fence_val)) {
+  hr = gst_d3d12_device_execute_command_lists (self->device,
+      D3D12_COMMAND_LIST_TYPE_DIRECT, 1, cmd_list, &priv->ctx->fence_val);
+  if (!gst_d3d12_result (hr, self->device)) {
     GST_ERROR_OBJECT (self, "Couldn't execute command list");
     gst_d3d12_fence_data_unref (fence_data);
     return GST_FLOW_ERROR;
   }
 
-  gst_d3d12_buffer_after_write (convert_buffer, priv->ctx->fence_val);
+  gst_d3d12_buffer_set_fence (convert_buffer,
+      gst_d3d12_device_get_fence_handle (self->device,
+          D3D12_COMMAND_LIST_TYPE_DIRECT), priv->ctx->fence_val, FALSE);
 
   gst_d3d12_device_set_fence_notify (self->device,
-      D3D12_COMMAND_LIST_TYPE_DIRECT, priv->ctx->fence_val, fence_data);
+      D3D12_COMMAND_LIST_TYPE_DIRECT, priv->ctx->fence_val,
+      FENCE_NOTIFY_MINI_OBJECT (fence_data));
 
   priv->ctx->scheduled.push (priv->ctx->fence_val);
 

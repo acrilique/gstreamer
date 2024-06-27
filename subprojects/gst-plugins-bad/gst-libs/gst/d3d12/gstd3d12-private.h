@@ -24,6 +24,7 @@
 #include <gst/d3d12/gstd3d12device-private.h>
 #include <gst/d3d12/gstd3d12format-private.h>
 #include <gst/d3d12/gstd3d12converter-private.h>
+#include <gst/d3d12/gstd3d12commandqueue-private.h>
 #include <gst/d3d12/gstd3d12compat.h>
 
 /*
@@ -41,19 +42,28 @@
 
 /* DXGI (semi) native formats */
 #define GST_D3D12_TIER_0_FORMATS \
-    "RGBA64_LE, RGB10A2_LE, Y410, VUYA, RGBA, BGRA, RBGA, P016_LE, P012_LE, " \
-    "P010_10LE, RGBx, BGRx, NV12"
+    "RGBA64_LE, BGRA64_LE, Y416_LE, Y412_LE, RGB10A2_LE, Y410, BGR10A2_LE, Y216_LE, Y212_LE, " \
+    "Y210, VUYA, RGBA, BGRA, RBGA, P016_LE, P012_LE, P010_10LE, RGBx, BGRx, " \
+    "YUY2, NV12"
 
 /* both SRV and RTV are supported */
 #define GST_D3D12_TIER_1_FORMATS \
-    "AYUV64, GBRA_12LE, GBRA_10LE, AYUV, ABGR, ARGB, GBRA, Y444_16LE, " \
+    "ARGB64_LE, AYUV64, GBRA_12LE, GBRA_10LE, AYUV, ABGR, ARGB, GBRA, Y444_16LE, " \
+    "A444_16LE, A444_12LE, A444_10LE, A444, " \
+    "A422_16LE, A422_12LE, A422_10LE, A422, A420_16LE, A420_12LE, A420_10LE, A420, AV12, " \
     "GBR_16LE, Y444_12LE, GBR_12LE, I422_12LE, I420_12LE, Y444_10LE, GBR_10LE, " \
-    "I422_10LE, I420_10LE, Y444, BGRP, GBR, RGBP, xBGR, xRGB, Y42B, NV21, " \
-    "I420, YV12, GRAY16_LE, GRAY8"
+    "I422_10LE, I420_10LE, Y444, BGRP, GBR, RGBP, xBGR, xRGB, Y42B, NV24, NV16, NV61, NV21, " \
+    "I420, YV12, Y41B, YUV9, YVU9, GRAY16_LE, GRAY8"
+
+/* pre/post processing required formats */
+#define GST_D3D12_TIER_LAST_FORMATS \
+    "v216, v210, r210, v308, IYU2, RGB, BGR, UYVY, VYUY, YVYU, RGB16, BGR16, " \
+    "RGB15, BGR15"
 
 #define GST_D3D12_COMMON_FORMATS \
     GST_D3D12_TIER_0_FORMATS ", " \
-    GST_D3D12_TIER_1_FORMATS
+    GST_D3D12_TIER_1_FORMATS ", " \
+    GST_D3D12_TIER_LAST_FORMATS
 
 #define GST_D3D12_ALL_FORMATS \
     "{ " GST_D3D12_COMMON_FORMATS " }"
@@ -88,5 +98,40 @@ public:
 private:
   GstD3D12Device *device_;
 };
+
+class GstD3D12DeviceDecoderLockGuard
+{
+public:
+  explicit GstD3D12DeviceDecoderLockGuard(GstD3D12Device * device) : device_ (device)
+  {
+    if (device_)
+      gst_d3d12_device_decoder_lock (device_);
+  }
+
+  ~GstD3D12DeviceDecoderLockGuard()
+  {
+    if (device_)
+      gst_d3d12_device_decoder_unlock (device_);
+  }
+
+  GstD3D12DeviceDecoderLockGuard(const GstD3D12DeviceDecoderLockGuard&) = delete;
+  GstD3D12DeviceDecoderLockGuard& operator=(const GstD3D12DeviceDecoderLockGuard&) = delete;
+
+private:
+  GstD3D12Device *device_;
+};
+
+static inline void
+gst_d3d12_com_release (IUnknown * unknown)
+{
+  if (unknown)
+    unknown->Release ();
+}
+
+#define FENCE_NOTIFY_COM(obj) \
+    ((gpointer) (obj)), ((GDestroyNotify) gst_d3d12_com_release)
+
+#define FENCE_NOTIFY_MINI_OBJECT(obj) \
+    ((gpointer) (obj)), ((GDestroyNotify) gst_mini_object_unref)
 
 #endif /* __cplusplus */

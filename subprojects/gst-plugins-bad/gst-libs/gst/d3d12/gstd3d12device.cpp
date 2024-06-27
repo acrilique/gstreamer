@@ -42,9 +42,22 @@
 #include <thread>
 #include <gmodule.h>
 #include <atomic>
+#include <sstream>
+#include <ios>
+
+#ifdef HAVE_DXGIDEBUG_H
+#include <dxgidebug.h>
+/* *INDENT-OFF* */
+typedef HRESULT (WINAPI * DXGIGetDebugInterface_t) (REFIID riid, void **iface);
+static DXGIGetDebugInterface_t GstDXGIGetDebugInterface = nullptr;
+static IDXGIInfoQueue *g_dxgi_info_queue = nullptr;
+static std::mutex g_dxgi_debug_lock;
+/* *INDENT-ON* */
+#endif
 
 GST_DEBUG_CATEGORY_STATIC (gst_d3d12_sdk_debug);
 GST_DEBUG_CATEGORY_STATIC (gst_d3d12_dred_debug);
+GST_DEBUG_CATEGORY_STATIC (gst_d3d12_dxgi_debug);
 
 #ifndef GST_DISABLE_GST_DEBUG
 #define GST_CAT_DEFAULT ensure_debug_category()
@@ -115,6 +128,8 @@ struct DeviceInner
 
     gst_clear_object (&direct_queue);
     gst_clear_object (&copy_queue);
+    for (guint i = 0; i < num_decode_queue; i++)
+      gst_clear_object (&decode_queue[i]);
 
     gst_clear_object (&direct_ca_pool);
     gst_clear_object (&direct_cl_pool);
@@ -143,6 +158,9 @@ struct DeviceInner
 
     if (copy_queue)
       gst_d3d12_command_queue_drain (copy_queue);
+
+    for (guint i = 0; i < num_decode_queue; i++)
+      gst_d3d12_command_queue_drain (decode_queue[i]);
   }
 
   void ReportLiveObjects ()
@@ -197,7 +215,6 @@ struct DeviceInner
   void RemoveClient (GstD3D12Device * client)
   {
     std::lock_guard <std::mutex> lk (lock);
-    auto it = clients.begin ();
     for (auto it = clients.begin (); it != clients.end(); it++) {
       if (*it == client) {
         clients.erase (it);
@@ -214,11 +231,17 @@ struct DeviceInner
   std::recursive_mutex extern_lock;
   std::recursive_mutex device11on12_lock;
   std::mutex lock;
+  CD3DX12FeatureSupport feature_support;
 
   ComPtr<ID3D12InfoQueue> info_queue;
 
   GstD3D12CommandQueue *direct_queue = nullptr;
   GstD3D12CommandQueue *copy_queue = nullptr;
+  GstD3D12CommandQueue *decode_queue[2] = { nullptr, };
+  guint num_decode_queue = 0;
+  guint decode_queue_index = 0;
+  std::recursive_mutex decoder_lock;
+  GstD3D12WAFlags wa_flags = GST_D3D12_WA_NONE;
 
   GstD3D12CommandListPool *direct_cl_pool = nullptr;
   GstD3D12CommandAllocatorPool *direct_ca_pool = nullptr;
@@ -578,6 +601,42 @@ gst_d3d12_device_enable_dred (void)
   return enabled;
 }
 
+static gboolean
+gst_d3d12_device_enable_dxgi_debug (void)
+{
+  static gboolean enabled = FALSE;
+#ifdef HAVE_DXGIDEBUG_H
+  static GModule *dxgi_debug_module = nullptr;
+  GST_D3D12_CALL_ONCE_BEGIN {
+    GST_DEBUG_CATEGORY_INIT (gst_d3d12_dxgi_debug,
+        "d3d12dxgidebug", 0, "d3d12dxgidebug");
+
+    if (!g_getenv ("GST_ENABLE_D3D12_DXGI_DEBUG"))
+      return;
+
+    dxgi_debug_module = g_module_open ("dxgidebug.dll", G_MODULE_BIND_LAZY);
+    if (!dxgi_debug_module)
+      return;
+
+    if (!g_module_symbol (dxgi_debug_module, "DXGIGetDebugInterface",
+            (gpointer *) & GstDXGIGetDebugInterface)) {
+      return;
+    }
+
+    auto hr = GstDXGIGetDebugInterface (IID_PPV_ARGS (&g_dxgi_info_queue));
+    if (FAILED (hr))
+      return;
+
+    GST_INFO ("DXGI debug is enabled");
+
+    enabled = TRUE;
+  }
+  GST_D3D12_CALL_ONCE_END;
+#endif
+
+  return enabled;
+}
+
 #define gst_d3d12_device_parent_class parent_class
 G_DEFINE_TYPE (GstD3D12Device, gst_d3d12_device, GST_TYPE_OBJECT);
 
@@ -698,169 +757,117 @@ gst_d3d12_device_get_property (GObject * object, guint prop_id,
   }
 }
 
-static gboolean
-check_format_support (GstD3D12Device * self, DXGI_FORMAT format,
-    guint flags, D3D12_FEATURE_DATA_FORMAT_SUPPORT * support)
+static void
+make_buffer_format (GstVideoFormat format, GstD3D12Format * d3d12_format)
 {
-  auto device = self->priv->inner->device;
-  HRESULT hr;
-
-  support->Format = format;
-  hr = device->CheckFeatureSupport (D3D12_FEATURE_FORMAT_SUPPORT, support,
-      sizeof (D3D12_FEATURE_DATA_FORMAT_SUPPORT));
-  if (FAILED (hr)) {
-    GST_INFO_OBJECT (self,
-        "Failed to check feature support for DXGI format %d", format);
-    return FALSE;
+  d3d12_format->format = format;
+  d3d12_format->dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  d3d12_format->dxgi_format = DXGI_FORMAT_UNKNOWN;
+  d3d12_format->support1 = D3D12_FORMAT_SUPPORT1_NONE;
+  d3d12_format->support2 = D3D12_FORMAT_SUPPORT2_NONE;
+  for (guint i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
+    d3d12_format->resource_format[i] = DXGI_FORMAT_UNKNOWN;
+    d3d12_format->uav_format[i] = DXGI_FORMAT_UNKNOWN;
   }
-
-  if (((guint) support->Support1 & flags) != flags) {
-    GST_INFO_OBJECT (self,
-        "DXGI format %d supports1 flag 0x%x, required 0x%x", format,
-        support->Support1, flags);
-
-    return FALSE;
-  }
-
-  return TRUE;
 }
 
 static void
 gst_d3d12_device_setup_format_table (GstD3D12Device * self)
 {
   auto priv = self->priv->inner;
+  auto & fs = priv->feature_support;
+  HRESULT hr;
 
-  for (guint i = 0; i < GST_D3D12_N_FORMATS; i++) {
-    const auto iter = &g_gst_d3d12_default_format_map[i];
-    D3D12_FEATURE_DATA_FORMAT_SUPPORT support[GST_VIDEO_MAX_PLANES];
-    gboolean native = true;
+  for (guint f = 0; f < GST_VIDEO_FORMAT_LAST; f++) {
+    GstD3D12Format format = { };
+    if (!gst_d3d12_get_format ((GstVideoFormat) f, &format))
+      continue;
 
-    switch (iter->format) {
-        /* RGB/GRAY */
-      case GST_VIDEO_FORMAT_BGRA:
-      case GST_VIDEO_FORMAT_BGRx:
-      case GST_VIDEO_FORMAT_RGBA:
-      case GST_VIDEO_FORMAT_RGBx:
-      case GST_VIDEO_FORMAT_RGB10A2_LE:
-      case GST_VIDEO_FORMAT_RGBA64_LE:
-      case GST_VIDEO_FORMAT_GRAY8:
-      case GST_VIDEO_FORMAT_GRAY16_LE:
-        if (!check_format_support (self, iter->dxgi_format,
-                iter->format_support1[0], &support[0])) {
-          continue;
-        }
-        break;
-        /* YUV DXGI native formats */
-      case GST_VIDEO_FORMAT_VUYA:
-      case GST_VIDEO_FORMAT_Y410:
-      case GST_VIDEO_FORMAT_NV12:
-      case GST_VIDEO_FORMAT_P010_10LE:
-      case GST_VIDEO_FORMAT_P012_LE:
-      case GST_VIDEO_FORMAT_P016_LE:
-      case GST_VIDEO_FORMAT_YUY2:
-      case GST_VIDEO_FORMAT_Y210:
-      case GST_VIDEO_FORMAT_Y212_LE:
-      case GST_VIDEO_FORMAT_Y412_LE:
-      case GST_VIDEO_FORMAT_BGRA64_LE:
-      case GST_VIDEO_FORMAT_BGR10A2_LE:
-      case GST_VIDEO_FORMAT_RBGA:
-      {
-        if (!check_format_support (self, iter->dxgi_format,
-                iter->format_support1[0], &support[0])) {
-          bool supported = true;
-          for (guint j = 0; j < GST_VIDEO_MAX_PLANES; j++) {
-            if (iter->resource_format[j] == DXGI_FORMAT_UNKNOWN)
-              break;
+    g_assert (format.dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+        format.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
 
-            if (!check_format_support (self, iter->resource_format[j],
-                    iter->format_support1[0], &support[j])) {
-              supported = false;
-              break;
-            }
-          }
-
-          if (!supported)
-            continue;
-
-          native = false;
-        }
-        break;
-      }
-        /* non-DXGI native formats */
-      case GST_VIDEO_FORMAT_NV21:
-      case GST_VIDEO_FORMAT_I420:
-      case GST_VIDEO_FORMAT_YV12:
-      case GST_VIDEO_FORMAT_I420_10LE:
-      case GST_VIDEO_FORMAT_I420_12LE:
-      case GST_VIDEO_FORMAT_Y42B:
-      case GST_VIDEO_FORMAT_I422_10LE:
-      case GST_VIDEO_FORMAT_I422_12LE:
-      case GST_VIDEO_FORMAT_Y444:
-      case GST_VIDEO_FORMAT_Y444_10LE:
-      case GST_VIDEO_FORMAT_Y444_12LE:
-      case GST_VIDEO_FORMAT_Y444_16LE:
-      case GST_VIDEO_FORMAT_AYUV:
-      case GST_VIDEO_FORMAT_AYUV64:
-      case GST_VIDEO_FORMAT_UYVY:
-      case GST_VIDEO_FORMAT_VYUY:
-      case GST_VIDEO_FORMAT_YVYU:
-      case GST_VIDEO_FORMAT_ARGB:
-      case GST_VIDEO_FORMAT_xRGB:
-      case GST_VIDEO_FORMAT_ABGR:
-      case GST_VIDEO_FORMAT_xBGR:
-      case GST_VIDEO_FORMAT_RGB:
-      case GST_VIDEO_FORMAT_BGR:
-      case GST_VIDEO_FORMAT_v210:
-      case GST_VIDEO_FORMAT_v216:
-      case GST_VIDEO_FORMAT_v308:
-      case GST_VIDEO_FORMAT_IYU2:
-      case GST_VIDEO_FORMAT_RGB16:
-      case GST_VIDEO_FORMAT_BGR16:
-      case GST_VIDEO_FORMAT_RGB15:
-      case GST_VIDEO_FORMAT_BGR15:
-      case GST_VIDEO_FORMAT_r210:
-        /* RGB planar formats */
-      case GST_VIDEO_FORMAT_RGBP:
-      case GST_VIDEO_FORMAT_BGRP:
-      case GST_VIDEO_FORMAT_GBR:
-      case GST_VIDEO_FORMAT_GBR_10LE:
-      case GST_VIDEO_FORMAT_GBR_12LE:
-      case GST_VIDEO_FORMAT_GBR_16LE:
-      case GST_VIDEO_FORMAT_GBRA:
-      case GST_VIDEO_FORMAT_GBRA_10LE:
-      case GST_VIDEO_FORMAT_GBRA_12LE:
-      {
-        bool supported = true;
-        native = false;
-
-        for (guint j = 0; j < GST_VIDEO_MAX_PLANES; j++) {
-          if (iter->resource_format[j] == DXGI_FORMAT_UNKNOWN)
-            break;
-
-          if (!check_format_support (self, iter->resource_format[j],
-                  iter->format_support1[0], &support[j])) {
-            supported = false;
-            break;
-          }
-        }
-
-        if (!supported)
-          continue;
-        break;
-      }
-      default:
-        g_assert_not_reached ();
-        return;
+    D3D12_FORMAT_SUPPORT1 support1 = D3D12_FORMAT_SUPPORT1_NONE;
+    D3D12_FORMAT_SUPPORT2 support2 = D3D12_FORMAT_SUPPORT2_NONE;
+    bool supported = false;
+    auto dxgi_format = format.dxgi_format;
+    if (format.dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      /* Buffer type is always supported */
+      supported = true;
     }
 
-    auto format = *iter;
+    if (!supported && dxgi_format != DXGI_FORMAT_UNKNOWN) {
+      /* packed or yuv semi-planar */
+      hr = fs.FormatSupport (format.dxgi_format, support1, support2);
+      if (SUCCEEDED (hr) && (support1 & format.support1) == format.support1 &&
+          (support2 & format.support2) == format.support2) {
+        supported = true;
+      } else if (dxgi_format == DXGI_FORMAT_B5G6R5_UNORM ||
+          dxgi_format == DXGI_FORMAT_B5G5R5A1_UNORM) {
+        /* This format may not be supported by old OS. Use R16_UINT
+         * with compute shader */
+        format.dxgi_format = DXGI_FORMAT_R16_UINT;
+        format.format_flags = GST_D3D12_FORMAT_FLAG_OUTPUT_UAV;
+        fs.FormatSupport (DXGI_FORMAT_R16_UINT, support1, support2);
+        format.support1 = support1;
+        format.support2 = support2;
+        format.resource_format[0] = DXGI_FORMAT_R16_UINT;
+        format.uav_format[0] = DXGI_FORMAT_R16_UINT;
+        supported = true;
+      } else {
+        format.dxgi_format = DXGI_FORMAT_UNKNOWN;
+      }
+    }
 
-    if (!native)
+    if (!supported) {
+      bool check_failed = false;
+      for (guint i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
+        auto resource_format = format.resource_format[i];
+        if (resource_format == DXGI_FORMAT_UNKNOWN)
+          break;
+
+        hr = fs.FormatSupport (resource_format, support1, support2);
+        if (FAILED (hr) || (support1 & format.support1) != format.support1 ||
+            (support2 & format.support2) != format.support2) {
+          check_failed = true;
+          break;
+        }
+      }
+
+      if (!check_failed)
+        supported = true;
+    }
+
+    if (!supported) {
+      /* Use buffer format */
+      format.dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
       format.dxgi_format = DXGI_FORMAT_UNKNOWN;
+      format.support1 = D3D12_FORMAT_SUPPORT1_NONE;
+      format.support2 = D3D12_FORMAT_SUPPORT2_NONE;
+      for (guint i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
+        format.resource_format[i] = DXGI_FORMAT_UNKNOWN;
+        format.uav_format[i] = DXGI_FORMAT_UNKNOWN;
+      }
+    } else {
+      format.support1 = support1;
+      format.support2 = support2;
+    }
 
-    for (guint j = 0; j < GST_VIDEO_MAX_PLANES; j++) {
-      format.format_support1[j] = support[j].Support1;
-      format.format_support2[j] = support[j].Support2;
+    if (format.dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      GST_LOG_OBJECT (self, "Format %s support: buffer",
+          gst_video_format_to_string (format.format));
+    } else {
+      GST_LOG_OBJECT (self, "Format %s support: dxgi-format: %s, "
+          "resource-format: [%s, %s, %s, %s]",
+          gst_video_format_to_string (format.format),
+          D3D12_PROPERTY_LAYOUT_FORMAT_TABLE::GetName (format.dxgi_format),
+          D3D12_PROPERTY_LAYOUT_FORMAT_TABLE::
+          GetName (format.resource_format[0]),
+          D3D12_PROPERTY_LAYOUT_FORMAT_TABLE::
+          GetName (format.resource_format[1]),
+          D3D12_PROPERTY_LAYOUT_FORMAT_TABLE::
+          GetName (format.resource_format[2]),
+          D3D12_PROPERTY_LAYOUT_FORMAT_TABLE::
+          GetName (format.resource_format[3]));
     }
 
     priv->format_table[format.format] = format;
@@ -914,6 +921,197 @@ gst_d3d12_device_find_adapter (const GstD3D12DeviceConstructData * data,
   return E_FAIL;
 }
 
+static gboolean
+is_intel_gen11_or_older (UINT vendor_id, D3D_FEATURE_LEVEL feature_level,
+    const std::string & description)
+{
+  if (vendor_id != 0x8086)
+    return FALSE;
+
+  /* Arc GPU supports feature level 12.2 and iGPU Xe does 12.1 */
+  if (feature_level <= D3D_FEATURE_LEVEL_12_0)
+    return TRUE;
+
+  /* gen 11 is UHD xxx, older ones are HD xxx */
+  if (description.find ("HD") != std::string::npos)
+    return TRUE;
+
+  return FALSE;
+}
+
+/* *INDENT-OFF* */
+#ifndef GST_DISABLE_GST_DEBUG
+static void
+dump_feature_support (GstD3D12Device * self)
+{
+  auto priv = self->priv->inner;
+  auto &fs = priv->feature_support;
+  std::stringstream dump;
+
+  dump << "Device feature supports of " << priv->description
+  << "\nD3D12_OPTIONS:"
+  << "\n    DoublePrecisionFloatShaderOps: "
+  << fs.DoublePrecisionFloatShaderOps()
+  << "\n    OutputMergerLogicOp: " << fs.OutputMergerLogicOp()
+  << std::showbase << std::hex
+  << "\n    MinPrecisionSupport: " << fs.MinPrecisionSupport()
+  << std::noshowbase << std::dec
+  << "\n    TiledResourcesTier: " << fs.TiledResourcesTier()
+  << "\n    ResourceBindingTier: " << fs.ResourceBindingTier()
+  << "\n    PSSpecifiedStencilRefSupported: "
+  << fs.PSSpecifiedStencilRefSupported()
+  << "\n    TypedUAVLoadAdditionalFormats: "
+  << fs.TypedUAVLoadAdditionalFormats()
+  << "\n    ROVsSupported: " << fs.ROVsSupported()
+  << "\n    ConservativeRasterizationTier: "
+  << fs.ConservativeRasterizationTier()
+  << "\n    MaxGPUVirtualAddressBitsPerResource: "
+  << fs.MaxGPUVirtualAddressBitsPerResource()
+  << "\n    StandardSwizzle64KBSupported: " << fs.StandardSwizzle64KBSupported()
+  << "\n    CrossNodeSharingTier: " << fs.CrossNodeSharingTier()
+  << "\n    CrossAdapterRowMajorTextureSupported: "
+  << fs.CrossAdapterRowMajorTextureSupported()
+  << "\n    VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation: "
+  << fs.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation()
+  << "\n    ResourceHeapTier: " << fs.ResourceHeapTier()
+  << std::showbase << std::hex
+  << "\nMaxSupportedFeatureLevel: " << fs.MaxSupportedFeatureLevel()
+  << "\nHighestShaderModel: " << fs.HighestShaderModel()
+  << std::noshowbase << std::dec
+  << "\nMaxGPUVirtualAddressBitsPerProcess: "
+  << fs.MaxGPUVirtualAddressBitsPerProcess()
+  << "\nD3D12_OPTIONS1:"
+  << "\n    WaveOps: " << fs.WaveOps()
+  << "\n    WaveLaneCountMin: " << fs.WaveLaneCountMin()
+  << "\n    WaveLaneCountMax: " << fs.WaveLaneCountMax()
+  << "\n    TotalLaneCount: " << fs.TotalLaneCount()
+  << "\n    ExpandedComputeResourceStates: "
+  << fs.ExpandedComputeResourceStates()
+  << "\n    Int64ShaderOps: " << fs.Int64ShaderOps()
+  << std::showbase << std::hex
+  << "\nProtectedResourceSessionSupport: "
+  << fs.ProtectedResourceSessionSupport()
+  << "\nHighestRootSignatureVersion: " << fs.HighestRootSignatureVersion()
+  << std::noshowbase << std::dec
+  << "\nARCHITECTURE1:"
+  << "\n    TileBasedRenderer: " << fs.TileBasedRenderer()
+  << "\n    UMA: " << fs.UMA()
+  << "\n    CacheCoherentUMA: " << fs.CacheCoherentUMA()
+  << "\n    IsolatedMMU: " << fs.IsolatedMMU()
+  << "\nD3D12_OPTIONS2:"
+  << "\n    DepthBoundsTestSupported: " << fs.DepthBoundsTestSupported()
+  << "\n    ProgrammableSamplePositionsTier: "
+  << fs.ProgrammableSamplePositionsTier()
+  << std::showbase << std::hex
+  << "\nShaderCacheSupportFlags: " << fs.ShaderCacheSupportFlags()
+  << std::noshowbase << std::dec
+  << "\nD3D12_OPTIONS3:"
+  << "\n    CopyQueueTimestampQueriesSupported: "
+  << fs.CopyQueueTimestampQueriesSupported()
+  << "\n    CastingFullyTypedFormatSupported: "
+  << fs.CastingFullyTypedFormatSupported()
+  << std::showbase << std::hex
+  << "\n    WriteBufferImmediateSupportFlags: "
+  << fs.WriteBufferImmediateSupportFlags()
+  << std::noshowbase << std::dec
+  << "\n    ViewInstancingTier: " << fs.ViewInstancingTier()
+  << "\n    BarycentricsSupported: " << fs.BarycentricsSupported()
+  << "\nExistingHeapsSupported: " << fs.ExistingHeapsSupported()
+  << "\nD3D12_OPTIONS4:"
+  << "\n    MSAA64KBAlignedTextureSupported: "
+  << fs.MSAA64KBAlignedTextureSupported()
+  << "\n    SharedResourceCompatibilityTier: "
+  << fs.SharedResourceCompatibilityTier()
+  << "\n    Native16BitShaderOpsSupported: "
+  << fs.Native16BitShaderOpsSupported()
+  << "\nHeapSerializationTier: " << fs.HeapSerializationTier()
+  << "\nCrossNodeAtomicShaderInstructions: "
+  << fs.CrossNodeAtomicShaderInstructions()
+  << "\nD3D12_OPTIONS5:"
+  << "\n    SRVOnlyTiledResourceTier3: " << fs.SRVOnlyTiledResourceTier3()
+  << "\n    RenderPassesTier: " << fs.RenderPassesTier()
+  << "\n    RaytracingTier: " << fs.RaytracingTier()
+  << "\nDisplayableTexture: " << fs.DisplayableTexture()
+  << "\nD3D12_OPTIONS6:"
+  << "\n    AdditionalShadingRatesSupported: "
+  << fs.AdditionalShadingRatesSupported()
+  << "\n    PerPrimitiveShadingRateSupportedWithViewportIndexing: "
+  << fs.PerPrimitiveShadingRateSupportedWithViewportIndexing()
+  << "\n    VariableShadingRateTier: " << fs.VariableShadingRateTier()
+  << "\n    ShadingRateImageTileSize: " << fs.ShadingRateImageTileSize()
+  << "\n    BackgroundProcessingSupported: "
+  << fs.BackgroundProcessingSupported()
+  << "\nD3D12_OPTIONS7:"
+  << "\n    MeshShaderTier: " << fs.MeshShaderTier()
+  << "\n    SamplerFeedbackTier: " << fs.SamplerFeedbackTier()
+  << "\nD3D12_OPTIONS8:"
+  << "\n    UnalignedBlockTexturesSupported: "
+  << fs.UnalignedBlockTexturesSupported()
+  << "\nD3D12_OPTIONS9:"
+  << "\n    MeshShaderPipelineStatsSupported: "
+  << fs.MeshShaderPipelineStatsSupported()
+  << "\n    MeshShaderSupportsFullRangeRenderTargetArrayIndex: "
+  << fs.MeshShaderSupportsFullRangeRenderTargetArrayIndex()
+  << "\n    AtomicInt64OnTypedResourceSupported: "
+  << fs.AtomicInt64OnTypedResourceSupported()
+  << "\n    AtomicInt64OnGroupSharedSupported: "
+  << fs.AtomicInt64OnGroupSharedSupported()
+  << "\n    DerivativesInMeshAndAmplificationShadersSupported: "
+  << fs.DerivativesInMeshAndAmplificationShadersSupported()
+  << "\n    WaveMMATier: " << fs.WaveMMATier()
+  << "\nD3D12_OPTIONS10:"
+  << "\n    VariableRateShadingSumCombinerSupported: "
+  << fs.VariableRateShadingSumCombinerSupported()
+  << "\n    MeshShaderPerPrimitiveShadingRateSupported: "
+  << fs.MeshShaderPerPrimitiveShadingRateSupported()
+  << "\nD3D12_OPTIONS11:"
+  << "\n    AtomicInt64OnDescriptorHeapResourceSupported: "
+  << fs.AtomicInt64OnDescriptorHeapResourceSupported()
+  << "\nD3D12_OPTIONS12:"
+  << "\n    MSPrimitivesPipelineStatisticIncludesCulledPrimitives: "
+  << fs.MSPrimitivesPipelineStatisticIncludesCulledPrimitives()
+  << "\n    EnhancedBarriersSupported: " << fs.EnhancedBarriersSupported()
+  << "\n    RelaxedFormatCastingSupported: "
+  << fs.RelaxedFormatCastingSupported()
+  << "\nD3D12_OPTIONS13:"
+  << "\n    UnrestrictedBufferTextureCopyPitchSupported: "
+  << fs.UnrestrictedBufferTextureCopyPitchSupported()
+  << "\n    UnrestrictedVertexElementAlignmentSupported: "
+  << fs.UnrestrictedVertexElementAlignmentSupported()
+  << "\n    InvertedViewportHeightFlipsYSupported: "
+  << fs.InvertedViewportHeightFlipsYSupported()
+  << "\n    InvertedViewportDepthFlipsZSupported: "
+  << fs.InvertedViewportDepthFlipsZSupported()
+  << "\n    TextureCopyBetweenDimensionsSupported: "
+  << fs.TextureCopyBetweenDimensionsSupported()
+  << "\n    AlphaBlendFactorSupported: " << fs.AlphaBlendFactorSupported()
+  << "\nD3D12_OPTIONS14:"
+  << "\n    AdvancedTextureOpsSupported: " << fs.AdvancedTextureOpsSupported()
+  << "\n    WriteableMSAATexturesSupported: "
+  << fs.WriteableMSAATexturesSupported()
+  << "\n    IndependentFrontAndBackStencilRefMaskSupported: "
+  << fs.IndependentFrontAndBackStencilRefMaskSupported()
+  << "\nD3D12_OPTIONS15:"
+  << "\n    TriangleFanSupported: " << fs.TriangleFanSupported()
+  << "\n    DynamicIndexBufferStripCutSupported: "
+  << fs.DynamicIndexBufferStripCutSupported()
+  << "\nD3D12_OPTIONS16:"
+  << "\n    DynamicDepthBiasSupported: " << fs.DynamicDepthBiasSupported()
+  << "\n    GPUUploadHeapSupported: " << fs.GPUUploadHeapSupported();
+
+  auto dump_str = dump.str ();
+  GST_DEBUG_OBJECT (self, "%s", dump_str.c_str ());
+}
+#endif
+/* *INDENT-ON* */
+
+struct TestFormatInfo
+{
+  DXGI_FORMAT format;
+  D3D12_FORMAT_SUPPORT1 support1;
+  D3D12_FORMAT_SUPPORT2 support2;
+};
+
 static GstD3D12Device *
 gst_d3d12_device_new_internal (const GstD3D12DeviceConstructData * data)
 {
@@ -923,9 +1121,72 @@ gst_d3d12_device_new_internal (const GstD3D12DeviceConstructData * data)
   HRESULT hr;
   UINT factory_flags = 0;
   guint index = 0;
+  /* *INDENT-OFF* */
+  const TestFormatInfo required_formats[] = {
+    { DXGI_FORMAT_R8G8B8A8_UNORM,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+          D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW |
+          D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+          D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE
+    },
+    { DXGI_FORMAT_R10G10B10A2_UNORM,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+          D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW |
+          D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+          D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE
+    },
+    { DXGI_FORMAT_R16G16B16A16_UNORM,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+          D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW |
+          D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+          D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE
+    },
+    { DXGI_FORMAT_B8G8R8A8_UNORM,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+          D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+      D3D12_FORMAT_SUPPORT2_NONE
+    },
+    { DXGI_FORMAT_R8_UNORM,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+          D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+      D3D12_FORMAT_SUPPORT2_NONE
+    },
+    { DXGI_FORMAT_R8G8_UNORM,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+          D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+      D3D12_FORMAT_SUPPORT2_NONE
+    },
+    { DXGI_FORMAT_R16_UNORM,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+          D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+      D3D12_FORMAT_SUPPORT2_NONE
+    },
+    { DXGI_FORMAT_R16G16_UNORM,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+          D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+      D3D12_FORMAT_SUPPORT2_NONE
+    },
+    { DXGI_FORMAT_R16_UINT,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+          D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW |
+          D3D12_FORMAT_SUPPORT1_SHADER_LOAD,
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE
+    },
+    { DXGI_FORMAT_R32_UINT,
+      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+          D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW |
+          D3D12_FORMAT_SUPPORT1_SHADER_LOAD,
+      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE
+    },
+  };
+  /* *INDENT-ON* */
 
   gst_d3d12_device_enable_debug ();
   gst_d3d12_device_enable_dred ();
+  gst_d3d12_device_enable_dxgi_debug ();
 
   hr = CreateDXGIFactory2 (factory_flags, IID_PPV_ARGS (&factory));
   if (FAILED (hr)) {
@@ -935,7 +1196,7 @@ gst_d3d12_device_new_internal (const GstD3D12DeviceConstructData * data)
 
   hr = gst_d3d12_device_find_adapter (data, factory.Get (), &index, &adapter);
   if (FAILED (hr)) {
-    GST_WARNING ("Could not find adapter, hr: 0x%x", (guint) hr);
+    GST_INFO ("Could not find adapter, hr: 0x%x", (guint) hr);
     return nullptr;
   }
 
@@ -969,13 +1230,47 @@ gst_d3d12_device_new_internal (const GstD3D12DeviceConstructData * data)
   std::wstring_convert < std::codecvt_utf8 < wchar_t >, wchar_t >converter;
   priv->description = converter.to_bytes (desc.Description);
 
+  priv->feature_support.Init (device.Get ());
+
   GST_INFO_OBJECT (self,
       "adapter index %d: D3D12 device vendor-id: 0x%04x, device-id: 0x%04x, "
-      "Flags: 0x%x, adapter-luid: %" G_GINT64_FORMAT ", %s",
+      "Flags: 0x%x, adapter-luid: %" G_GINT64_FORMAT ", is-UMA: %d, "
+      "feature-level: 0x%x, %s",
       priv->adapter_index, desc.VendorId, desc.DeviceId, desc.Flags,
-      priv->adapter_luid, priv->description.c_str ());
+      priv->adapter_luid, priv->feature_support.UMA (),
+      priv->feature_support.MaxSupportedFeatureLevel (),
+      priv->description.c_str ());
+
+  /* Minimum required format support. Feature level 11.0 device should support
+   * below formats */
+  for (guint i = 0; i < G_N_ELEMENTS (required_formats); i++) {
+    D3D12_FORMAT_SUPPORT1 support1;
+    D3D12_FORMAT_SUPPORT2 support2;
+    const auto & format = required_formats[i];
+    hr = priv->feature_support.FormatSupport (format.format,
+        support1, support2);
+    if (FAILED (hr) || (support1 & format.support1) != format.support1 ||
+        (support2 & format.support2) != format.support2) {
+      auto format_name =
+          D3D12_PROPERTY_LAYOUT_FORMAT_TABLE::GetName (format.format);
+      GST_WARNING_OBJECT (self, "Device does not support DXGI format %d (%s)",
+          format.format, format_name);
+      gst_object_unref (self);
+      return nullptr;
+    }
+  }
+
+#ifndef GST_DISABLE_GST_DEBUG
+  if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_DEBUG)
+    dump_feature_support (self);
+#endif
 
   gst_d3d12_device_setup_format_table (self);
+  if (priv->feature_support.UMA () && is_intel_gen11_or_older (priv->vendor_id,
+          priv->feature_support.MaxSupportedFeatureLevel (),
+          priv->description)) {
+    priv->wa_flags |= GST_D3D12_WA_DECODER_RACE;
+  }
 
   if (gst_d3d12_device_enable_debug ()) {
     ComPtr < ID3D12InfoQueue > info_queue;
@@ -988,7 +1283,7 @@ gst_d3d12_device_new_internal (const GstD3D12DeviceConstructData * data)
   queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
 
   priv->direct_queue = gst_d3d12_command_queue_new (device.Get (),
-      &queue_desc, D3D12_FENCE_FLAG_SHARED, 0);
+      &queue_desc, D3D12_FENCE_FLAG_SHARED, 32);
   if (!priv->direct_queue)
     goto error;
 
@@ -1004,7 +1299,7 @@ gst_d3d12_device_new_internal (const GstD3D12DeviceConstructData * data)
 
   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
   priv->copy_queue = gst_d3d12_command_queue_new (device.Get (),
-      &queue_desc, D3D12_FENCE_FLAG_NONE, 0);
+      &queue_desc, D3D12_FENCE_FLAG_NONE, 32);
   if (!priv->copy_queue)
     goto error;
 
@@ -1022,6 +1317,30 @@ gst_d3d12_device_new_internal (const GstD3D12DeviceConstructData * data)
       device->GetDescriptorHandleIncrementSize (D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
   priv->fence_data_pool = gst_d3d12_fence_data_pool_new ();
+
+  {
+    ComPtr < ID3D12VideoDevice > video_device;
+    auto hr = device.As (&video_device);
+    if (SUCCEEDED (hr)) {
+      queue_desc.Type = D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE;
+      for (guint i = 0; i < G_N_ELEMENTS (priv->decode_queue); i++) {
+        priv->decode_queue[i] = gst_d3d12_command_queue_new (device.Get (),
+            &queue_desc, D3D12_FENCE_FLAG_NONE, 8);
+        if (!priv->decode_queue[i])
+          break;
+
+        GST_OBJECT_FLAG_SET (priv->decode_queue[i],
+            GST_OBJECT_FLAG_MAY_BE_LEAKED);
+        priv->num_decode_queue++;
+
+        /* XXX: Old Intel iGPU crashes with multiple decode queues */
+        if ((priv->wa_flags & GST_D3D12_WA_DECODER_RACE) ==
+            GST_D3D12_WA_DECODER_RACE) {
+          break;
+        }
+      }
+    }
+  }
 
   GST_OBJECT_FLAG_SET (priv->direct_queue, GST_OBJECT_FLAG_MAY_BE_LEAKED);
   GST_OBJECT_FLAG_SET (priv->direct_cl_pool, GST_OBJECT_FLAG_MAY_BE_LEAKED);
@@ -1155,6 +1474,41 @@ gst_d3d12_device_get_factory_handle (GstD3D12Device * device)
 }
 
 /**
+ * gst_d3d12_device_get_fence_handle:
+ * @device: a #GstD3D12Device
+ * @queue_type: a D3D12_COMMAND_LIST_TYPE
+ *
+ * Gets fence handle of command queue
+ *
+ * Returns: (transfer none): ID3D12Fence handle
+ *
+ * Since: 1.26
+ */
+ID3D12Fence *
+gst_d3d12_device_get_fence_handle (GstD3D12Device * device,
+    D3D12_COMMAND_LIST_TYPE queue_type)
+{
+  g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), nullptr);
+
+  auto priv = device->priv->inner;
+  GstD3D12CommandQueue *queue;
+
+  switch (queue_type) {
+    case D3D12_COMMAND_LIST_TYPE_DIRECT:
+      queue = priv->direct_queue;
+      break;
+    case D3D12_COMMAND_LIST_TYPE_COPY:
+      queue = priv->copy_queue;
+      break;
+    default:
+      GST_ERROR_OBJECT (device, "Not supported queue type %d", queue_type);
+      return nullptr;
+  }
+
+  return gst_d3d12_command_queue_get_fence_handle (queue);
+}
+
+/**
  * gst_d3d12_device_get_format:
  * @device: a #GstD3D12Device
  * @format: a #GstVideoFormat
@@ -1228,16 +1582,16 @@ gst_d3d12_device_get_command_queue (GstD3D12Device * device,
  * Exectues gst_d3d12_command_queue_execute_command_lists ()
  * using a #GstD3D12CommandQueue corresponding to @queue_type
  *
- * Returns: %TRUE if successful
+ * Returns: HRESULT code
  *
  * Since: 1.26
  */
-gboolean
+HRESULT
 gst_d3d12_device_execute_command_lists (GstD3D12Device * device,
     D3D12_COMMAND_LIST_TYPE queue_type, guint num_command_lists,
     ID3D12CommandList ** command_lists, guint64 * fence_value)
 {
-  g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), FALSE);
+  g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), E_INVALIDARG);
 
   auto priv = device->priv->inner;
   GstD3D12CommandQueue *queue;
@@ -1251,13 +1605,11 @@ gst_d3d12_device_execute_command_lists (GstD3D12Device * device,
       break;
     default:
       GST_ERROR_OBJECT (device, "Not supported queue type %d", queue_type);
-      return FALSE;
+      return E_INVALIDARG;
   }
 
-  auto hr = gst_d3d12_command_queue_execute_command_lists (queue,
+  return gst_d3d12_command_queue_execute_command_lists (queue,
       num_command_lists, command_lists, fence_value);
-
-  return gst_d3d12_result (hr, device);
 }
 
 /**
@@ -1297,7 +1649,7 @@ gst_d3d12_device_get_completed_value (GstD3D12Device * device,
 }
 
 /**
- * gst_d3d12_device_get_completed_value:
+ * gst_d3d12_device_set_fence_notify:
  * @device: a #GstD3D12Device
  * @queue_type: a D3D12_COMMAND_LIST_TYPE
  * @fence_value: target fence value
@@ -1314,7 +1666,7 @@ gst_d3d12_device_get_completed_value (GstD3D12Device * device,
 gboolean
 gst_d3d12_device_set_fence_notify (GstD3D12Device * device,
     D3D12_COMMAND_LIST_TYPE queue_type, guint64 fence_value,
-    GstD3D12FenceData * fence_data)
+    gpointer fence_data, GDestroyNotify notify)
 {
   g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), FALSE);
   g_return_val_if_fail (fence_data, FALSE);
@@ -1334,8 +1686,7 @@ gst_d3d12_device_set_fence_notify (GstD3D12Device * device,
       return FALSE;
   }
 
-  gst_d3d12_command_queue_set_notify (queue, fence_value, fence_data,
-      (GDestroyNotify) gst_d3d12_fence_data_unref);
+  gst_d3d12_command_queue_set_notify (queue, fence_value, fence_data, notify);
 
   return TRUE;
 }
@@ -1350,16 +1701,16 @@ gst_d3d12_device_set_fence_notify (GstD3D12Device * device,
  * Exectues gst_d3d12_command_queue_fence_wait ()
  * using a #GstD3D12CommandQueue corresponding to @queue_type
  *
- * Returns: %TRUE if successful
+ * Returns: HRESULT code
  *
  * Since: 1.26
  */
-gboolean
+HRESULT
 gst_d3d12_device_fence_wait (GstD3D12Device * device,
     D3D12_COMMAND_LIST_TYPE queue_type, guint64 fence_value,
     HANDLE event_handle)
 {
-  g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), FALSE);
+  g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), E_INVALIDARG);
 
   auto priv = device->priv->inner;
   GstD3D12CommandQueue *queue;
@@ -1373,20 +1724,17 @@ gst_d3d12_device_fence_wait (GstD3D12Device * device,
       break;
     default:
       GST_ERROR_OBJECT (device, "Not supported queue type %d", queue_type);
-      return FALSE;
+      return E_INVALIDARG;
   }
 
-  auto hr = gst_d3d12_command_queue_fence_wait (queue,
-      fence_value, event_handle);
-
-  return gst_d3d12_result (hr, device);
+  return gst_d3d12_command_queue_fence_wait (queue, fence_value, event_handle);
 }
 
 gboolean
 gst_d3d12_device_copy_texture_region (GstD3D12Device * device,
     guint num_args, const GstD3D12CopyTextureRegionArgs * args,
-    GstD3D12FenceData * fence_data,
-    ID3D12Fence * fence_to_wait, guint64 fence_value_to_wait,
+    GstD3D12FenceData * fence_data, guint num_fences_to_wait,
+    ID3D12Fence ** fences_to_wait, const guint64 * fence_values_to_wait,
     D3D12_COMMAND_LIST_TYPE command_type, guint64 * fence_value)
 {
   g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), FALSE);
@@ -1430,7 +1778,7 @@ gst_d3d12_device_copy_texture_region (GstD3D12Device * device,
     return FALSE;
   }
 
-  gst_d3d12_fence_data_add_notify_mini_object (fence_data, gst_ca);
+  gst_d3d12_fence_data_push (fence_data, FENCE_NOTIFY_MINI_OBJECT (gst_ca));
 
   auto ca = gst_d3d12_command_allocator_get_handle (gst_ca);
   gst_d3d12_command_list_pool_acquire (cl_pool, ca, &gst_cl);
@@ -1462,8 +1810,10 @@ gst_d3d12_device_copy_texture_region (GstD3D12Device * device,
   }
 
   ID3D12CommandList *cmd_list[] = { cl.Get () };
-  hr = gst_d3d12_command_queue_execute_wait_and_command_lists (queue,
-      fence_to_wait, fence_value_to_wait, 1, cmd_list, &fence_val);
+
+  hr = gst_d3d12_command_queue_execute_command_lists_full (queue,
+      num_fences_to_wait, fences_to_wait, fence_values_to_wait, 1, cmd_list,
+      &fence_val);
   auto ret = gst_d3d12_result (hr, device);
 
   /* We can release command list since command list pool will hold it */
@@ -1521,46 +1871,84 @@ gst_d3d12_device_d3d12_debug (GstD3D12Device * device, const gchar * file,
   g_return_if_fail (GST_IS_D3D12_DEVICE (device));
 
   auto priv = device->priv->inner;
-  if (!priv->info_queue)
-    return;
+  if (priv->info_queue) {
+    std::lock_guard < std::recursive_mutex > lk (priv->extern_lock);
+    ID3D12InfoQueue *info_queue = priv->info_queue.Get ();
+    UINT64 num_msg = info_queue->GetNumStoredMessages ();
+    for (guint64 i = 0; i < num_msg; i++) {
+      HRESULT hr;
+      SIZE_T msg_len;
+      D3D12_MESSAGE *msg;
+      GstDebugLevel msg_level;
+      GstDebugLevel selected_level;
 
-  std::lock_guard < std::recursive_mutex > lk (priv->extern_lock);
-  ID3D12InfoQueue *info_queue = priv->info_queue.Get ();
-  UINT64 num_msg = info_queue->GetNumStoredMessages ();
-  for (guint64 i = 0; i < num_msg; i++) {
-    HRESULT hr;
-    SIZE_T msg_len;
-    D3D12_MESSAGE *msg;
-    GstDebugLevel msg_level;
-    GstDebugLevel selected_level;
+      hr = info_queue->GetMessage (i, nullptr, &msg_len);
+      if (FAILED (hr) || msg_len == 0)
+        continue;
 
-    hr = info_queue->GetMessage (i, nullptr, &msg_len);
-    if (FAILED (hr) || msg_len == 0)
-      continue;
+      msg = (D3D12_MESSAGE *) g_malloc0 (msg_len);
+      hr = info_queue->GetMessage (i, msg, &msg_len);
+      if (FAILED (hr) || msg_len == 0) {
+        g_free (msg);
+        continue;
+      }
 
-    msg = (D3D12_MESSAGE *) g_malloc0 (msg_len);
-    hr = info_queue->GetMessage (i, msg, &msg_len);
-    if (FAILED (hr) || msg_len == 0) {
+      msg_level = d3d12_message_severity_to_gst (msg->Severity);
+      if (msg->Category == D3D12_MESSAGE_CATEGORY_STATE_CREATION &&
+          msg_level > GST_LEVEL_ERROR) {
+        /* Do not warn for live object, since there would be live object
+         * when ReportLiveDeviceObjects was called */
+        selected_level = GST_LEVEL_INFO;
+      } else {
+        selected_level = msg_level;
+      }
+
+      gst_debug_log (gst_d3d12_sdk_debug, selected_level, file, function, line,
+          G_OBJECT (device), "D3D12InfoQueue: %s", msg->pDescription);
       g_free (msg);
-      continue;
     }
 
-    msg_level = d3d12_message_severity_to_gst (msg->Severity);
-    if (msg->Category == D3D12_MESSAGE_CATEGORY_STATE_CREATION &&
-        msg_level > GST_LEVEL_ERROR) {
-      /* Do not warn for live object, since there would be live object
-       * when ReportLiveDeviceObjects was called */
-      selected_level = GST_LEVEL_INFO;
-    } else {
-      selected_level = msg_level;
-    }
-
-    gst_debug_log (gst_d3d12_sdk_debug, selected_level, file, function, line,
-        G_OBJECT (device), "D3D12InfoQueue: %s", msg->pDescription);
-    g_free (msg);
+    info_queue->ClearStoredMessages ();
   }
 
-  info_queue->ClearStoredMessages ();
+#ifdef HAVE_DXGIDEBUG_H
+  if (gst_d3d12_device_enable_dxgi_debug ()) {
+    std::lock_guard < std::mutex > lk (g_dxgi_debug_lock);
+
+    UINT64 num_msg = g_dxgi_info_queue->GetNumStoredMessages (DXGI_DEBUG_ALL);
+    for (UINT64 i = 0; i < num_msg; i++) {
+      SIZE_T msg_len;
+      auto hr = g_dxgi_info_queue->GetMessage (DXGI_DEBUG_ALL,
+          i, nullptr, &msg_len);
+      if (FAILED (hr) || msg_len == 0)
+        continue;
+
+      auto msg = (DXGI_INFO_QUEUE_MESSAGE *) g_malloc0 (msg_len);
+      hr = g_dxgi_info_queue->GetMessage (DXGI_DEBUG_ALL, i, msg, &msg_len);
+
+      GstDebugLevel level = GST_LEVEL_LOG;
+      switch (msg->Severity) {
+        case DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION:
+        case DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR:
+          level = GST_LEVEL_ERROR;
+        case DXGI_INFO_QUEUE_MESSAGE_SEVERITY_WARNING:
+          level = GST_LEVEL_WARNING;
+        case DXGI_INFO_QUEUE_MESSAGE_SEVERITY_INFO:
+          level = GST_LEVEL_INFO;
+        case DXGI_INFO_QUEUE_MESSAGE_SEVERITY_MESSAGE:
+          level = GST_LEVEL_DEBUG;
+        default:
+          break;
+      }
+
+      gst_debug_log (gst_d3d12_dxgi_debug, level, file, function, line,
+          G_OBJECT (device), "DXGIInfoQueue: %s", msg->pDescription);
+      g_free (msg);
+    }
+
+    g_dxgi_info_queue->ClearStoredMessages (DXGI_DEBUG_ALL);
+  }
+#endif
 }
 
 void
@@ -1621,6 +2009,7 @@ gst_d3d12_device_clear_yuv_texture (GstD3D12Device * device, GstMemory * mem)
 
   ID3D12CommandList *cmd_list[] = { cl.Get () };
   guint64 fence_val = 0;
+  auto fence = gst_d3d12_command_queue_get_fence_handle (priv->direct_queue);
   hr = gst_d3d12_command_queue_execute_command_lists (priv->direct_queue,
       1, cmd_list, &fence_val);
   auto ret = gst_d3d12_result (hr, device);
@@ -1629,7 +2018,7 @@ gst_d3d12_device_clear_yuv_texture (GstD3D12Device * device, GstMemory * mem)
   if (ret) {
     gst_d3d12_command_queue_set_notify (priv->direct_queue, fence_val,
         gst_ca, (GDestroyNotify) gst_d3d12_command_allocator_unref);
-    dmem->fence_value = fence_val;
+    gst_d3d12_memory_set_fence (dmem, fence, fence_val, FALSE);
   } else {
     gst_d3d12_command_allocator_unref (gst_ca);
   }
@@ -1736,4 +2125,49 @@ gst_d3d12_device_check_device_removed (GstD3D12Device * device)
     auto manager = DeviceCacheManager::GetInstance ();
     manager->OnDeviceRemoved (priv->adapter_luid);
   }
+}
+
+GstD3D12CommandQueue *
+gst_d3d12_device_get_decode_queue (GstD3D12Device * device)
+{
+  g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), nullptr);
+  auto priv = device->priv->inner;
+
+  if (!priv->num_decode_queue)
+    return nullptr;
+
+  std::lock_guard < std::mutex > lk (priv->lock);
+  auto queue = priv->decode_queue[priv->decode_queue_index];
+  priv->decode_queue_index++;
+  priv->decode_queue_index %= priv->num_decode_queue;
+
+  return queue;
+}
+
+void
+gst_d3d12_device_decoder_lock (GstD3D12Device * device)
+{
+  g_return_if_fail (GST_IS_D3D12_DEVICE (device));
+
+  auto priv = device->priv->inner;
+  if ((priv->wa_flags & GST_D3D12_WA_DECODER_RACE) == GST_D3D12_WA_DECODER_RACE)
+    priv->decoder_lock.lock ();
+}
+
+void
+gst_d3d12_device_decoder_unlock (GstD3D12Device * device)
+{
+  g_return_if_fail (GST_IS_D3D12_DEVICE (device));
+
+  auto priv = device->priv->inner;
+  if ((priv->wa_flags & GST_D3D12_WA_DECODER_RACE) == GST_D3D12_WA_DECODER_RACE)
+    priv->decoder_lock.unlock ();
+}
+
+GstD3D12WAFlags
+gst_d3d12_device_get_workaround_flags (GstD3D12Device * device)
+{
+  g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), GST_D3D12_WA_NONE);
+
+  return device->priv->inner->wa_flags;
 }

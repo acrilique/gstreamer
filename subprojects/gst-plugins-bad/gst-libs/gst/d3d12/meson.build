@@ -4,6 +4,8 @@ d3d12_sources = [
   'gstd3d12commandlistpool.cpp',
   'gstd3d12commandqueue.cpp',
   'gstd3d12converter-builder.cpp',
+  'gstd3d12converter-unpack.cpp',
+  'gstd3d12converter-pack.cpp',
   'gstd3d12converter.cpp',
   'gstd3d12descriptorpool.cpp',
   'gstd3d12device.cpp',
@@ -122,6 +124,18 @@ endif
 # x86 with Windows 7 or older may not support SSE2
 if host_machine.cpu_family() != 'x86'
   extra_args += ['-DHAVE_DIRECTX_MATH_SIMD']
+endif
+
+if cc.compiles('''
+  #include <dxgi.h>
+  #include <dxgidebug.h>
+  int main(int argc, char ** argv) {
+    IDXGIDebug *debug = NULL;
+    IDXGIInfoQueue *info_queue = NULL;
+    return 0;
+  }''',
+  name: 'DXGI debug layer support in Windows SDK')
+  extra_args += ['-DHAVE_DXGIDEBUG_H']
 endif
 
 pkg_name = 'gstreamer-d3d12-' + api_version

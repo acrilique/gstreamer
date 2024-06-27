@@ -608,27 +608,27 @@ apply_gap (GstQueue * queue, GstEvent * event,
 
   gst_event_parse_gap (event, &timestamp, &duration);
 
-  if (GST_CLOCK_TIME_IS_VALID (timestamp)) {
-    if (is_sink && !GST_CLOCK_STIME_IS_VALID (queue->sink_start_time)) {
-      queue->sink_start_time = my_segment_to_running_time (segment, timestamp);
-      GST_DEBUG_OBJECT (queue, "Start time updated to %" GST_STIME_FORMAT,
-          GST_STIME_ARGS (queue->sink_start_time));
-    }
+  g_return_if_fail (GST_CLOCK_TIME_IS_VALID (timestamp));
 
-    if (GST_CLOCK_TIME_IS_VALID (duration)) {
-      timestamp += duration;
-    }
-
-    segment->position = timestamp;
-
-    if (is_sink)
-      queue->sink_tainted = TRUE;
-    else
-      queue->src_tainted = TRUE;
-
-    /* calc diff with other end */
-    update_time_level (queue);
+  if (is_sink && !GST_CLOCK_STIME_IS_VALID (queue->sink_start_time)) {
+    queue->sink_start_time = my_segment_to_running_time (segment, timestamp);
+    GST_DEBUG_OBJECT (queue, "Start time updated to %" GST_STIME_FORMAT,
+        GST_STIME_ARGS (queue->sink_start_time));
   }
+
+  if (GST_CLOCK_TIME_IS_VALID (duration)) {
+    timestamp += duration;
+  }
+
+  segment->position = timestamp;
+
+  if (is_sink)
+    queue->sink_tainted = TRUE;
+  else
+    queue->src_tainted = TRUE;
+
+  /* calc diff with other end */
+  update_time_level (queue);
 }
 
 
@@ -642,10 +642,10 @@ apply_buffer (GstQueue * queue, GstBuffer * buffer, GstSegment * segment,
   timestamp = GST_BUFFER_DTS_OR_PTS (buffer);
   duration = GST_BUFFER_DURATION (buffer);
 
-  /* if no timestamp is set, assume it's continuous with the previous
-   * time */
+  /* if no timestamp is set, assume it didn't change compared to the previous
+   * buffer and simply return here */
   if (timestamp == GST_CLOCK_TIME_NONE)
-    timestamp = segment->position;
+    return;
 
   if (is_sink && !GST_CLOCK_STIME_IS_VALID (queue->sink_start_time) &&
       GST_CLOCK_TIME_IS_VALID (timestamp)) {
@@ -696,7 +696,8 @@ buffer_list_apply_time (GstBuffer ** buf, guint idx, gpointer user_data)
     data->timestamp = btime;
   }
 
-  if (GST_BUFFER_DURATION_IS_VALID (*buf))
+  if (GST_BUFFER_DURATION_IS_VALID (*buf)
+      && GST_CLOCK_TIME_IS_VALID (data->timestamp))
     data->timestamp += GST_BUFFER_DURATION (*buf);
 
   GST_TRACE ("ts now %" GST_TIME_FORMAT, GST_TIME_ARGS (data->timestamp));
@@ -713,10 +714,14 @@ apply_buffer_list (GstQueue * queue, GstBufferList * buffer_list,
 
   data.first_timestamp = GST_CLOCK_TIME_NONE;
 
-  /* if no timestamp is set, assume it's continuous with the previous time */
-  data.timestamp = segment->position;
+  /* if no timestamp is set, assume it didn't change compared to the previous
+   * buffer and simply return here without updating */
+  data.timestamp = GST_CLOCK_TIME_NONE;
 
   gst_buffer_list_foreach (buffer_list, buffer_list_apply_time, &data);
+
+  if (!GST_CLOCK_TIME_IS_VALID (data.timestamp))
+    return;
 
   if (is_sink && !GST_CLOCK_STIME_IS_VALID (queue->sink_start_time) &&
       GST_CLOCK_TIME_IS_VALID (data.first_timestamp)) {

@@ -2526,7 +2526,7 @@ gst_rtspsrc_create_stream (GstRTSPSrc * src, GstSDPMessage * sdp, gint idx,
      * If the control_path starts with a non rtsp: protocol we will most
      * likely build a URL that the server will fail to understand, this is ok,
      * we will fail then. */
-    if (g_str_has_prefix (control_path, "rtsp://"))
+    if (gst_uri_is_valid (control_path))
       stream->conninfo.location = g_strdup (control_path);
     else {
       const gchar *base;
@@ -6733,7 +6733,8 @@ propagate_error:
 
 static GstRTSPResult
 gst_rtsp_src_receive_response (GstRTSPSrc * src, GstRTSPConnInfo * conninfo,
-    GstRTSPMessage * response, GstRTSPStatusCode * code)
+    GstRTSPMessage * response, GstRTSPStatusCode * code,
+    gboolean update_content_base)
 {
   GstRTSPStatusCode thecode;
   gchar *content_base = NULL;
@@ -6794,12 +6795,14 @@ next:
   if (thecode != GST_RTSP_STS_OK)
     return GST_RTSP_OK;
 
-  /* store new content base if any */
-  gst_rtsp_message_get_header (response, GST_RTSP_HDR_CONTENT_BASE,
-      &content_base, 0);
-  if (content_base) {
-    g_free (src->content_base);
-    src->content_base = g_strdup (content_base);
+  if (update_content_base) {
+    /* store new content base if any */
+    gst_rtsp_message_get_header (response, GST_RTSP_HDR_CONTENT_BASE,
+        &content_base, 0);
+    if (content_base) {
+      g_free (src->content_base);
+      src->content_base = g_strdup (content_base);
+    }
   }
 
   return GST_RTSP_OK;
@@ -6846,7 +6849,7 @@ server_eof:
 static GstRTSPResult
 gst_rtspsrc_try_send (GstRTSPSrc * src, GstRTSPConnInfo * conninfo,
     GstRTSPMessage * request, GstRTSPMessage * response,
-    GstRTSPStatusCode * code)
+    GstRTSPStatusCode * code, gboolean update_content_base)
 {
   GstRTSPResult res;
   gint try = 0;
@@ -6875,7 +6878,9 @@ again:
   if (!response)
     return res;
 
-  res = gst_rtsp_src_receive_response (src, conninfo, response, code);
+  res =
+      gst_rtsp_src_receive_response (src, conninfo, response, code,
+      update_content_base);
   if (res == GST_RTSP_EEOF) {
     GST_WARNING_OBJECT (src, "server closed connection");
     /* only try once after reconnect, then fallthrough and error out */
@@ -6951,7 +6956,8 @@ receive_error:
 static GstRTSPResult
 gst_rtspsrc_send (GstRTSPSrc * src, GstRTSPConnInfo * conninfo,
     GstRTSPMessage * request, GstRTSPMessage * response,
-    GstRTSPStatusCode * code, GstRTSPVersion * versions)
+    GstRTSPStatusCode * code, GstRTSPVersion * versions,
+    gboolean update_content_base)
 {
   GstRTSPStatusCode int_code = GST_RTSP_STS_OK;
   GstRTSPResult res = GST_RTSP_ERROR;
@@ -6976,7 +6982,7 @@ gst_rtspsrc_send (GstRTSPSrc * src, GstRTSPConnInfo * conninfo,
 
     if ((res =
             gst_rtspsrc_try_send (src, conninfo, request, response,
-                &int_code)) < 0)
+                &int_code, update_content_base)) < 0)
       goto error;
 
     switch (int_code) {
@@ -7103,7 +7109,8 @@ static GstRTSPResult
 gst_rtspsrc_send_cb (GstRTSPExtension * ext, GstRTSPMessage * request,
     GstRTSPMessage * response, GstRTSPSrc * src)
 {
-  return gst_rtspsrc_send (src, &src->conninfo, request, response, NULL, NULL);
+  return gst_rtspsrc_send (src, &src->conninfo, request, response, NULL, NULL,
+      FALSE);
 }
 
 
@@ -7589,7 +7596,7 @@ gst_rtspsrc_setup_streams_end (GstRTSPSrc * src, gboolean async)
     if (!src->conninfo.connection)
       conninfo = &((GstRTSPStream *) tmp->data)->conninfo;
 
-    gst_rtsp_src_receive_response (src, conninfo, &response, NULL);
+    gst_rtsp_src_receive_response (src, conninfo, &response, NULL, FALSE);
 
     gst_rtsp_src_setup_stream_from_response (src, stream,
         &response, NULL, 0, NULL, NULL);
@@ -7820,7 +7827,7 @@ gst_rtspsrc_setup_streams_start (GstRTSPSrc * src, gboolean async)
     /* handle the code ourselves */
     res =
         gst_rtspsrc_send (src, conninfo, &request,
-        pipelined_request_id ? NULL : &response, &code, NULL);
+        pipelined_request_id ? NULL : &response, &code, NULL, FALSE);
     if (res < 0)
       goto send_error;
 
@@ -7866,7 +7873,7 @@ gst_rtspsrc_setup_streams_start (GstRTSPSrc * src, gboolean async)
          *   https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/1447
          */
         if (!tried_non_compliant_url && stream->control_url
-            && !g_str_has_prefix (stream->control_url, "rtsp://")) {
+            && !gst_uri_is_valid (stream->control_url)) {
           const gchar *base;
 
           gst_rtsp_message_unset (&request);
@@ -8260,23 +8267,29 @@ gst_rtspsrc_open_from_sdp (GstRTSPSrc * src, GstSDPMessage * sdp,
       if (control == NULL)
         break;
 
+      if (g_strcmp0 (control, "*") == 0)
+        break;
+
       /* only take fully qualified urls */
-      if (g_str_has_prefix (control, "rtsp://"))
+      if (gst_uri_is_valid (control))
         break;
     }
-    if (control) {
-      g_free (src->conninfo.location);
-      src->conninfo.location = g_strdup (control);
-      /* make a connection for this, if there was a connection already, nothing
-       * happens. */
-      if (gst_rtsp_conninfo_connect (src, &src->conninfo, async) < 0) {
-        GST_ERROR_OBJECT (src, "could not connect");
+
+    if (g_strcmp0 (control, "*") != 0) {
+      if (control) {
+        g_free (src->conninfo.location);
+        src->conninfo.location = g_strdup (control);
+        /* make a connection for this, if there was a connection already, nothing
+         * happens. */
+        if (gst_rtsp_conninfo_connect (src, &src->conninfo, async) < 0) {
+          GST_ERROR_OBJECT (src, "could not connect");
+        }
       }
+      /* we need to keep the control url separate from the connection url because
+       * the rules for constructing the media control url need it */
+      g_free (src->control);
+      src->control = g_strdup (control);
     }
-    /* we need to keep the control url separate from the connection url because
-     * the rules for constructing the media control url need it */
-    g_free (src->control);
-    src->control = g_strdup (control);
   }
 
   /* create streams */
@@ -8357,7 +8370,7 @@ restart:
 
   if ((res =
           gst_rtspsrc_send (src, &src->conninfo, &request, &response,
-              NULL, versions)) < 0) {
+              NULL, versions, TRUE)) < 0) {
     goto send_error;
   }
 
@@ -8394,7 +8407,7 @@ restart:
 
   if ((res =
           gst_rtspsrc_send (src, &src->conninfo, &request, &response,
-              NULL, NULL)) < 0)
+              NULL, NULL, TRUE)) < 0)
     goto send_error;
 
   /* we only perform redirect for describe and play, currently */
@@ -8635,7 +8648,8 @@ gst_rtspsrc_close (GstRTSPSrc * src, gboolean async, gboolean only_close)
       GST_ELEMENT_PROGRESS (src, CONTINUE, "close", ("Closing stream"));
 
     if ((res =
-            gst_rtspsrc_send (src, info, &request, &response, NULL, NULL)) < 0)
+            gst_rtspsrc_send (src, info, &request, &response, NULL, NULL,
+                FALSE)) < 0)
       goto send_error;
 
     /* FIXME, parse result? */
@@ -9082,7 +9096,8 @@ restart:
       GST_ELEMENT_PROGRESS (src, CONTINUE, "request", ("Sending PLAY request"));
 
     if ((res =
-            gst_rtspsrc_send (src, conninfo, &request, &response, NULL, NULL))
+            gst_rtspsrc_send (src, conninfo, &request, &response, NULL, NULL,
+                FALSE))
         < 0)
       goto send_error;
 
@@ -9315,7 +9330,7 @@ gst_rtspsrc_pause (GstRTSPSrc * src, gboolean async)
 
     if ((res =
             gst_rtspsrc_send (src, conninfo, &request, &response, NULL,
-                NULL)) < 0)
+                NULL, FALSE)) < 0)
       goto send_error;
 
     gst_rtsp_message_unset (&request);
@@ -9690,7 +9705,6 @@ gst_rtspsrc_change_state (GstElement * element, GstStateChange transition)
       }
       break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
-      rtspsrc->seek_seqnum = GST_SEQNUM_INVALID;
       gst_rtspsrc_loop_send_cmd_and_wait (rtspsrc, CMD_CLOSE, CMD_ALL,
           rtspsrc->teardown_timeout);
       ret = GST_STATE_CHANGE_SUCCESS;
@@ -9925,7 +9939,7 @@ gst_rtspsrc_get_parameter (GstRTSPSrc * src, ParameterRequest * req)
   }
 
   if ((res = gst_rtspsrc_send (src, &src->conninfo,
-              &request, &response, &code, NULL)) < 0)
+              &request, &response, &code, NULL, FALSE)) < 0)
     goto send_error;
 
   res = gst_rtsp_message_get_body (&response, (guint8 **) & recv_body,
@@ -10045,7 +10059,7 @@ gst_rtspsrc_set_parameter (GstRTSPSrc * src, ParameterRequest * req)
   }
 
   if ((res = gst_rtspsrc_send (src, &src->conninfo,
-              &request, &response, &code, NULL)) < 0)
+              &request, &response, &code, NULL, FALSE)) < 0)
     goto send_error;
 
 done:

@@ -73,6 +73,12 @@ struct PS_OUTPUT_CHROMA_PLANAR
   float4 Plane1: SV_TARGET1;
 };
 
+struct PS_OUTPUT_LUMA_ALPHA
+{
+  float4 Plane0: SV_TARGET0;
+  float4 Plane1: SV_TARGET1;
+};
+
 struct PS_OUTPUT_PLANAR
 {
   float4 Plane0: SV_TARGET0;
@@ -156,6 +162,18 @@ class SamplerNV21 : ISampler
   }
 };
 
+class SamplerAV12 : ISampler
+{
+  float4 Execute (float2 uv)
+  {
+    float4 sample;
+    sample.x = shaderTexture_0.Sample(samplerState, uv).x;
+    sample.yz = shaderTexture_1.Sample(samplerState, uv).xy;
+    sample.a = shaderTexture_2.Sample(samplerState, uv).x;
+    return sample;
+  }
+};
+
 class SamplerI420 : ISampler
 {
   float4 Execute (float2 uv)
@@ -203,6 +221,45 @@ class SamplerI420_12 : ISampler
     sample.y = shaderTexture_1.Sample(samplerState, uv).x;
     sample.z = shaderTexture_2.Sample(samplerState, uv).x;
     return float4 (saturate (sample * 16.0), 1.0);
+  }
+};
+
+class SamplerA420 : ISampler
+{
+  float4 Execute (float2 uv)
+  {
+    float4 sample;
+    sample.x = shaderTexture_0.Sample(samplerState, uv).x;
+    sample.y = shaderTexture_1.Sample(samplerState, uv).x;
+    sample.z = shaderTexture_2.Sample(samplerState, uv).x;
+    sample.a = shaderTexture_3.Sample(samplerState, uv).x;
+    return sample;
+  }
+};
+
+class SamplerA420_10 : ISampler
+{
+  float4 Execute (float2 uv)
+  {
+    float4 sample;
+    sample.x = shaderTexture_0.Sample(samplerState, uv).x;
+    sample.y = shaderTexture_1.Sample(samplerState, uv).x;
+    sample.z = shaderTexture_2.Sample(samplerState, uv).x;
+    sample.a = shaderTexture_3.Sample(samplerState, uv).x;
+    return float4 (saturate (sample * 64.0));
+  }
+};
+
+class SamplerA420_12 : ISampler
+{
+  float4 Execute (float2 uv)
+  {
+    float4 sample;
+    sample.x = shaderTexture_0.Sample(samplerState, uv).x;
+    sample.y = shaderTexture_1.Sample(samplerState, uv).x;
+    sample.z = shaderTexture_2.Sample(samplerState, uv).x;
+    sample.a = shaderTexture_3.Sample(samplerState, uv).x;
+    return float4 (saturate (sample * 16.0));
   }
 };
 
@@ -515,6 +572,38 @@ class SamplerRBGAPremul : ISampler
   }
 };
 
+class SamplerRGB16 : ISampler
+{
+  float4 Execute (float2 uv)
+  {
+    return float4 (shaderTexture_0.Sample(samplerState, uv).rgb, 1.0);
+  }
+};
+
+class SamplerBGR16 : ISampler
+{
+  float4 Execute (float2 uv)
+  {
+    return float4 (shaderTexture_0.Sample(samplerState, uv).bgr, 1.0);
+  }
+};
+
+class SamplerRGB15 : ISampler
+{
+  float4 Execute (float2 uv)
+  {
+    return float4 (shaderTexture_0.Sample(samplerState, uv).rgb, 1.0);
+  }
+};
+
+class SamplerBGR15 : ISampler
+{
+  float4 Execute (float2 uv)
+  {
+    return float4 (shaderTexture_0.Sample(samplerState, uv).bgr, 1.0);
+  }
+};
+
 interface IConverter
 {
   float4 Execute (float4 sample);
@@ -717,7 +806,8 @@ class OutputChromaNV21 : IOutputChroma
 };
 
 interface IOutputChromaPlanar
-{ PS_OUTPUT_CHROMA_PLANAR Build (float4 sample);
+{
+  PS_OUTPUT_CHROMA_PLANAR Build (float4 sample);
 };
 
 class OutputChromaI420 : IOutputChromaPlanar
@@ -760,6 +850,48 @@ class OutputChromaI420_12 : IOutputChromaPlanar
   {
     PS_OUTPUT_CHROMA_PLANAR output;
     float2 scaled = UnormTo12bit (sample.yz);
+    output.Plane0 = float4 (scaled.x, 0, 0, 0);
+    output.Plane1 = float4 (scaled.y, 0, 0, 0);
+    return output;
+  }
+};
+
+interface IOutputLumaAlpha
+{
+  PS_OUTPUT_LUMA_ALPHA Build (float4 sample);
+};
+
+class OutputLumaAlphaA420 : IOutputLumaAlpha
+{
+  PS_OUTPUT_LUMA_ALPHA Build (float4 sample)
+  {
+    PS_OUTPUT_LUMA_ALPHA output;
+    output.Plane0 = float4 (sample.x, 0, 0, 0);
+    output.Plane1 = float4 (sample.a * alphaFactor, 0, 0, 0);
+    return output;
+  }
+};
+
+class OutputLumaAlphaA420_10 : IOutputLumaAlpha
+{
+  PS_OUTPUT_LUMA_ALPHA Build (float4 sample)
+  {
+    PS_OUTPUT_LUMA_ALPHA output;
+    sample.a *= alphaFactor;
+    float2 scaled = UnormTo10bit (sample.xw);
+    output.Plane0 = float4 (scaled.x, 0, 0, 0);
+    output.Plane1 = float4 (scaled.y, 0, 0, 0);
+    return output;
+  }
+};
+
+class OutputLumaAlphaA420_12 : IOutputLumaAlpha
+{
+  PS_OUTPUT_LUMA_ALPHA Build (float4 sample)
+  {
+    PS_OUTPUT_LUMA_ALPHA output;
+    sample.a *= alphaFactor;
+    float2 scaled = UnormTo12bit (sample.xw);
     output.Plane0 = float4 (scaled.x, 0, 0, 0);
     output.Plane1 = float4 (scaled.y, 0, 0, 0);
     return output;
@@ -969,6 +1101,51 @@ class OutputGBRAPremul_12 : IOutputPlanarFull
   }
 };
 
+class OutputA444 : IOutputPlanarFull
+{
+  PS_OUTPUT_PLANAR_FULL Build (float4 sample)
+  {
+    PS_OUTPUT_PLANAR_FULL output;
+    output.Plane0 = float4 (sample.x, 0, 0, 0);
+    output.Plane1 = float4 (sample.y, 0, 0, 0);
+    output.Plane2 = float4 (sample.z, 0, 0, 0);
+    output.Plane3 = float4 (sample.a * alphaFactor, 0, 0, 0);
+    return output;
+  }
+};
+
+class OutputA444_10 : IOutputPlanarFull
+{
+  PS_OUTPUT_PLANAR_FULL Build (float4 sample)
+  {
+    PS_OUTPUT_PLANAR_FULL output;
+    float4 scaled;
+    sample.a *= alphaFactor;
+    scaled = UnormTo10bit (sample);
+    output.Plane0 = float4 (scaled.x, 0, 0, 0);
+    output.Plane1 = float4 (scaled.y, 0, 0, 0);
+    output.Plane2 = float4 (scaled.z, 0, 0, 0);
+    output.Plane3 = float4 (scaled.a, 0, 0, 0);
+    return output;
+  }
+};
+
+class OutputA444_12 : IOutputPlanarFull
+{
+  PS_OUTPUT_PLANAR_FULL Build (float4 sample)
+  {
+    PS_OUTPUT_PLANAR_FULL output;
+    float4 scaled;
+    sample.a *= alphaFactor;
+    scaled = UnormTo12bit (sample);
+    output.Plane0 = float4 (scaled.x, 0, 0, 0);
+    output.Plane1 = float4 (scaled.y, 0, 0, 0);
+    output.Plane2 = float4 (scaled.z, 0, 0, 0);
+    output.Plane3 = float4 (scaled.a, 0, 0, 0);
+    return output;
+  }
+};
+
 interface IOutputPacked
 {
   PS_OUTPUT_PACKED Build (float4 sample);
@@ -1131,6 +1308,46 @@ class OutputRBGAPremul : IOutputPacked
   }
 };
 
+class OutputRGB16 : IOutputPacked
+{
+  PS_OUTPUT_PACKED Build (float4 sample)
+  {
+    PS_OUTPUT_PACKED output;
+    output.Plane0 = float4 (sample.rgb, 1.0);
+    return output;
+  }
+};
+
+class OutputBGR16 : IOutputPacked
+{
+  PS_OUTPUT_PACKED Build (float4 sample)
+  {
+    PS_OUTPUT_PACKED output;
+    output.Plane0 = float4 (sample.bgr, 1.0);
+    return output;
+  }
+};
+
+class OutputRGB15 : IOutputPacked
+{
+  PS_OUTPUT_PACKED Build (float4 sample)
+  {
+    PS_OUTPUT_PACKED output;
+    output.Plane0 = float4 (sample.rgb, 1.0);
+    return output;
+  }
+};
+
+class OutputBGR15 : IOutputPacked
+{
+  PS_OUTPUT_PACKED Build (float4 sample)
+  {
+    PS_OUTPUT_PACKED output;
+    output.Plane0 = float4 (sample.bgr, 1.0);
+    return output;
+  }
+};
+
 OUTPUT_TYPE ENTRY_POINT (PS_INPUT input)
 {
   SAMPLER g_sampler;
@@ -1190,6 +1407,12 @@ static const char str_PSMain_converter[] =
 "};\n"
 "\n"
 "struct PS_OUTPUT_CHROMA_PLANAR\n"
+"{\n"
+"  float4 Plane0: SV_TARGET0;\n"
+"  float4 Plane1: SV_TARGET1;\n"
+"};\n"
+"\n"
+"struct PS_OUTPUT_LUMA_ALPHA\n"
 "{\n"
 "  float4 Plane0: SV_TARGET0;\n"
 "  float4 Plane1: SV_TARGET1;\n"
@@ -1278,6 +1501,18 @@ static const char str_PSMain_converter[] =
 "  }\n"
 "};\n"
 "\n"
+"class SamplerAV12 : ISampler\n"
+"{\n"
+"  float4 Execute (float2 uv)\n"
+"  {\n"
+"    float4 sample;\n"
+"    sample.x = shaderTexture_0.Sample(samplerState, uv).x;\n"
+"    sample.yz = shaderTexture_1.Sample(samplerState, uv).xy;\n"
+"    sample.a = shaderTexture_2.Sample(samplerState, uv).x;\n"
+"    return sample;\n"
+"  }\n"
+"};\n"
+"\n"
 "class SamplerI420 : ISampler\n"
 "{\n"
 "  float4 Execute (float2 uv)\n"
@@ -1325,6 +1560,45 @@ static const char str_PSMain_converter[] =
 "    sample.y = shaderTexture_1.Sample(samplerState, uv).x;\n"
 "    sample.z = shaderTexture_2.Sample(samplerState, uv).x;\n"
 "    return float4 (saturate (sample * 16.0), 1.0);\n"
+"  }\n"
+"};\n"
+"\n"
+"class SamplerA420 : ISampler\n"
+"{\n"
+"  float4 Execute (float2 uv)\n"
+"  {\n"
+"    float4 sample;\n"
+"    sample.x = shaderTexture_0.Sample(samplerState, uv).x;\n"
+"    sample.y = shaderTexture_1.Sample(samplerState, uv).x;\n"
+"    sample.z = shaderTexture_2.Sample(samplerState, uv).x;\n"
+"    sample.a = shaderTexture_3.Sample(samplerState, uv).x;\n"
+"    return sample;\n"
+"  }\n"
+"};\n"
+"\n"
+"class SamplerA420_10 : ISampler\n"
+"{\n"
+"  float4 Execute (float2 uv)\n"
+"  {\n"
+"    float4 sample;\n"
+"    sample.x = shaderTexture_0.Sample(samplerState, uv).x;\n"
+"    sample.y = shaderTexture_1.Sample(samplerState, uv).x;\n"
+"    sample.z = shaderTexture_2.Sample(samplerState, uv).x;\n"
+"    sample.a = shaderTexture_3.Sample(samplerState, uv).x;\n"
+"    return float4 (saturate (sample * 64.0));\n"
+"  }\n"
+"};\n"
+"\n"
+"class SamplerA420_12 : ISampler\n"
+"{\n"
+"  float4 Execute (float2 uv)\n"
+"  {\n"
+"    float4 sample;\n"
+"    sample.x = shaderTexture_0.Sample(samplerState, uv).x;\n"
+"    sample.y = shaderTexture_1.Sample(samplerState, uv).x;\n"
+"    sample.z = shaderTexture_2.Sample(samplerState, uv).x;\n"
+"    sample.a = shaderTexture_3.Sample(samplerState, uv).x;\n"
+"    return float4 (saturate (sample * 16.0));\n"
 "  }\n"
 "};\n"
 "\n"
@@ -1637,6 +1911,38 @@ static const char str_PSMain_converter[] =
 "  }\n"
 "};\n"
 "\n"
+"class SamplerRGB16 : ISampler\n"
+"{\n"
+"  float4 Execute (float2 uv)\n"
+"  {\n"
+"    return float4 (shaderTexture_0.Sample(samplerState, uv).rgb, 1.0);\n"
+"  }\n"
+"};\n"
+"\n"
+"class SamplerBGR16 : ISampler\n"
+"{\n"
+"  float4 Execute (float2 uv)\n"
+"  {\n"
+"    return float4 (shaderTexture_0.Sample(samplerState, uv).bgr, 1.0);\n"
+"  }\n"
+"};\n"
+"\n"
+"class SamplerRGB15 : ISampler\n"
+"{\n"
+"  float4 Execute (float2 uv)\n"
+"  {\n"
+"    return float4 (shaderTexture_0.Sample(samplerState, uv).rgb, 1.0);\n"
+"  }\n"
+"};\n"
+"\n"
+"class SamplerBGR15 : ISampler\n"
+"{\n"
+"  float4 Execute (float2 uv)\n"
+"  {\n"
+"    return float4 (shaderTexture_0.Sample(samplerState, uv).bgr, 1.0);\n"
+"  }\n"
+"};\n"
+"\n"
 "interface IConverter\n"
 "{\n"
 "  float4 Execute (float4 sample);\n"
@@ -1839,7 +2145,8 @@ static const char str_PSMain_converter[] =
 "};\n"
 "\n"
 "interface IOutputChromaPlanar\n"
-"{ PS_OUTPUT_CHROMA_PLANAR Build (float4 sample);\n"
+"{\n"
+"  PS_OUTPUT_CHROMA_PLANAR Build (float4 sample);\n"
 "};\n"
 "\n"
 "class OutputChromaI420 : IOutputChromaPlanar\n"
@@ -1888,6 +2195,47 @@ static const char str_PSMain_converter[] =
 "  }\n"
 "};\n"
 "\n"
+"interface IOutputLumaAlpha\n"
+"{\n"
+"  PS_OUTPUT_LUMA_ALPHA Build (float4 sample);\n"
+"};\n"
+"\n"
+"class OutputLumaAlphaA420 : IOutputLumaAlpha\n"
+"{\n"
+"  PS_OUTPUT_LUMA_ALPHA Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_LUMA_ALPHA output;\n"
+"    output.Plane0 = float4 (sample.x, 0, 0, 0);\n"
+"    output.Plane1 = float4 (sample.a * alphaFactor, 0, 0, 0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
+"class OutputLumaAlphaA420_10 : IOutputLumaAlpha\n"
+"{\n"
+"  PS_OUTPUT_LUMA_ALPHA Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_LUMA_ALPHA output;\n"
+"    sample.a *= alphaFactor;\n"
+"    float2 scaled = UnormTo10bit (sample.xw);\n"
+"    output.Plane0 = float4 (scaled.x, 0, 0, 0);\n"
+"    output.Plane1 = float4 (scaled.y, 0, 0, 0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
+"class OutputLumaAlphaA420_12 : IOutputLumaAlpha\n"
+"{\n"
+"  PS_OUTPUT_LUMA_ALPHA Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_LUMA_ALPHA output;\n"
+"    sample.a *= alphaFactor;\n"
+"    float2 scaled = UnormTo12bit (sample.xw);\n"
+"    output.Plane0 = float4 (scaled.x, 0, 0, 0);\n"
+"    output.Plane1 = float4 (scaled.y, 0, 0, 0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
 "interface IOutputPlanar\n"
 "{\n"
 "  PS_OUTPUT_PLANAR Build (float4 sample);\n"
@@ -2091,6 +2439,51 @@ static const char str_PSMain_converter[] =
 "  }\n"
 "};\n"
 "\n"
+"class OutputA444 : IOutputPlanarFull\n"
+"{\n"
+"  PS_OUTPUT_PLANAR_FULL Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_PLANAR_FULL output;\n"
+"    output.Plane0 = float4 (sample.x, 0, 0, 0);\n"
+"    output.Plane1 = float4 (sample.y, 0, 0, 0);\n"
+"    output.Plane2 = float4 (sample.z, 0, 0, 0);\n"
+"    output.Plane3 = float4 (sample.a * alphaFactor, 0, 0, 0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
+"class OutputA444_10 : IOutputPlanarFull\n"
+"{\n"
+"  PS_OUTPUT_PLANAR_FULL Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_PLANAR_FULL output;\n"
+"    float4 scaled;\n"
+"    sample.a *= alphaFactor;\n"
+"    scaled = UnormTo10bit (sample);\n"
+"    output.Plane0 = float4 (scaled.x, 0, 0, 0);\n"
+"    output.Plane1 = float4 (scaled.y, 0, 0, 0);\n"
+"    output.Plane2 = float4 (scaled.z, 0, 0, 0);\n"
+"    output.Plane3 = float4 (scaled.a, 0, 0, 0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
+"class OutputA444_12 : IOutputPlanarFull\n"
+"{\n"
+"  PS_OUTPUT_PLANAR_FULL Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_PLANAR_FULL output;\n"
+"    float4 scaled;\n"
+"    sample.a *= alphaFactor;\n"
+"    scaled = UnormTo12bit (sample);\n"
+"    output.Plane0 = float4 (scaled.x, 0, 0, 0);\n"
+"    output.Plane1 = float4 (scaled.y, 0, 0, 0);\n"
+"    output.Plane2 = float4 (scaled.z, 0, 0, 0);\n"
+"    output.Plane3 = float4 (scaled.a, 0, 0, 0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
 "interface IOutputPacked\n"
 "{\n"
 "  PS_OUTPUT_PACKED Build (float4 sample);\n"
@@ -2249,6 +2642,46 @@ static const char str_PSMain_converter[] =
 "    PS_OUTPUT_PACKED output;\n"
 "    sample.a *= alphaFactor;\n"
 "    output.Plane0 = DoAlphaPremul (sample).rbga;\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
+"class OutputRGB16 : IOutputPacked\n"
+"{\n"
+"  PS_OUTPUT_PACKED Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_PACKED output;\n"
+"    output.Plane0 = float4 (sample.rgb, 1.0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
+"class OutputBGR16 : IOutputPacked\n"
+"{\n"
+"  PS_OUTPUT_PACKED Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_PACKED output;\n"
+"    output.Plane0 = float4 (sample.bgr, 1.0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
+"class OutputRGB15 : IOutputPacked\n"
+"{\n"
+"  PS_OUTPUT_PACKED Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_PACKED output;\n"
+"    output.Plane0 = float4 (sample.rgb, 1.0);\n"
+"    return output;\n"
+"  }\n"
+"};\n"
+"\n"
+"class OutputBGR15 : IOutputPacked\n"
+"{\n"
+"  PS_OUTPUT_PACKED Build (float4 sample)\n"
+"  {\n"
+"    PS_OUTPUT_PACKED output;\n"
+"    output.Plane0 = float4 (sample.bgr, 1.0);\n"
 "    return output;\n"
 "  }\n"
 "};\n"

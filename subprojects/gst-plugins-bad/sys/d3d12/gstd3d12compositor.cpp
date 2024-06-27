@@ -1028,8 +1028,8 @@ gst_d3d12_compositor_pad_setup_converter (GstVideoAggregatorPad * pad,
     auto ctx = std::make_unique < PadContext > (self->device);
     ctx->info = pad->info;
 
-    ctx->conv = gst_d3d12_converter_new (self->device, &pad->info, info,
-        &priv->blend_desc, priv->blend_factor, nullptr);
+    ctx->conv = gst_d3d12_converter_new (self->device, nullptr, &pad->info,
+        info, &priv->blend_desc, priv->blend_factor, nullptr);
     if (!ctx->conv) {
       GST_ERROR_OBJECT (pad, "Couldn't create converter");
       return FALSE;
@@ -1127,7 +1127,7 @@ gst_d3d12_compositor_preprare_func (GstVideoAggregatorPad * pad,
 
   GstD3D12FenceData *fence_data;
   gst_d3d12_fence_data_pool_acquire (self->priv->fence_data_pool, &fence_data);
-  gst_d3d12_fence_data_add_notify_mini_object (fence_data, gst_ca);
+  gst_d3d12_fence_data_push (fence_data, FENCE_NOTIFY_MINI_OBJECT (gst_ca));
 
   auto ca = gst_d3d12_command_allocator_get_handle (gst_ca);
 
@@ -1156,12 +1156,9 @@ gst_d3d12_compositor_preprare_func (GstVideoAggregatorPad * pad,
     }
   }
 
-  auto cq = gst_d3d12_device_get_command_queue (priv->ctx->device,
-      D3D12_COMMAND_LIST_TYPE_DIRECT);
-  auto cq_handle = gst_d3d12_command_queue_get_handle (cq);
   if (!gst_d3d12_converter_convert_buffer (priv->ctx->conv,
           buffer, self->priv->generated_output_buf, fence_data,
-          priv->ctx->cl.Get (), cq_handle)) {
+          priv->ctx->cl.Get (), TRUE)) {
     GST_ERROR_OBJECT (self, "Couldn't build command list");
     gst_d3d12_fence_data_unref (fence_data);
     return FALSE;
@@ -1221,7 +1218,7 @@ gst_d3d12_compositor_pad_clean_frame (GstVideoAggregatorPad * pad,
   if (priv->ctx && priv->ctx->fence_data) {
     gst_d3d12_device_set_fence_notify (priv->ctx->device,
         D3D12_COMMAND_LIST_TYPE_DIRECT, priv->ctx->fence_val,
-        priv->ctx->fence_data);
+        FENCE_NOTIFY_MINI_OBJECT (priv->ctx->fence_data));
     priv->ctx->fence_data = nullptr;
   }
 }
@@ -2233,7 +2230,7 @@ gst_d3d12_compositor_draw_background (GstD3D12Compositor * self)
 
   GstD3D12FenceData *fence_data;
   gst_d3d12_fence_data_pool_acquire (priv->fence_data_pool, &fence_data);
-  gst_d3d12_fence_data_add_notify_mini_object (fence_data, gst_ca);
+  gst_d3d12_fence_data_push (fence_data, FENCE_NOTIFY_MINI_OBJECT (gst_ca));
 
   auto ca = gst_d3d12_command_allocator_get_handle (gst_ca);
 
@@ -2321,24 +2318,27 @@ gst_d3d12_compositor_draw_background (GstD3D12Compositor * self)
 
   ID3D12CommandList *cmd_list[] = { cl.Get () };
 
-  if (!gst_d3d12_device_execute_command_lists (self->device,
-          D3D12_COMMAND_LIST_TYPE_DIRECT, 1, cmd_list,
-          &priv->bg_render->fence_val)) {
+  hr = gst_d3d12_device_execute_command_lists (self->device,
+      D3D12_COMMAND_LIST_TYPE_DIRECT, 1, cmd_list, &priv->bg_render->fence_val);
+  if (!gst_d3d12_result (hr, self->device)) {
     GST_ERROR_OBJECT (self, "Couldn't execute command list");
     gst_d3d12_fence_data_unref (fence_data);
     return FALSE;
   }
 
-  gst_d3d12_buffer_after_write (priv->generated_output_buf,
-      bg_render->fence_val);
+  auto fence = gst_d3d12_device_get_fence_handle (self->device,
+      D3D12_COMMAND_LIST_TYPE_DIRECT);
+  gst_d3d12_buffer_set_fence (priv->generated_output_buf, fence,
+      bg_render->fence_val, FALSE);
 
   if (bg_render->vertex_index_upload) {
-    gst_d3d12_fence_data_add_notify_com (fence_data,
-        bg_render->vertex_index_upload.Detach ());
+    gst_d3d12_fence_data_push (fence_data,
+        FENCE_NOTIFY_COM (bg_render->vertex_index_upload.Detach ()));
   }
 
   gst_d3d12_device_set_fence_notify (self->device,
-      D3D12_COMMAND_LIST_TYPE_DIRECT, priv->bg_render->fence_val, fence_data);
+      D3D12_COMMAND_LIST_TYPE_DIRECT, priv->bg_render->fence_val,
+      FENCE_NOTIFY_MINI_OBJECT (fence_data));
 
   return TRUE;
 }
@@ -2385,6 +2385,8 @@ gst_d3d12_compositor_aggregate_frames (GstVideoAggregator * vagg,
   }
 
   guint64 fence_val = priv->bg_render->fence_val;
+  auto fence = gst_d3d12_device_get_fence_handle (self->device,
+      D3D12_COMMAND_LIST_TYPE_DIRECT);
   GST_OBJECT_LOCK (self);
   for (iter = GST_ELEMENT (vagg)->sinkpads; iter; iter = g_list_next (iter)) {
     auto pad = GST_VIDEO_AGGREGATOR_PAD (iter->data);
@@ -2412,16 +2414,19 @@ gst_d3d12_compositor_aggregate_frames (GstVideoAggregator * vagg,
     GST_LOG_OBJECT (cpad, "Command list prepared");
 
     ID3D12CommandList *cmd_list[] = { pad_priv->ctx->cl.Get () };
-    if (!gst_d3d12_device_execute_command_lists (self->device,
-            D3D12_COMMAND_LIST_TYPE_DIRECT, 1, cmd_list,
-            &pad_priv->ctx->fence_val)) {
+
+    auto hr = gst_d3d12_device_execute_command_lists (self->device,
+        D3D12_COMMAND_LIST_TYPE_DIRECT, 1, cmd_list,
+        &pad_priv->ctx->fence_val);
+    if (!gst_d3d12_result (hr, self->device)) {
       GST_ERROR_OBJECT (self, "Couldn't execute command list");
       ret = GST_FLOW_ERROR;
       break;
     }
 
     fence_val = pad_priv->ctx->fence_val;
-    gst_d3d12_buffer_after_write (priv->generated_output_buf, fence_val);
+    gst_d3d12_buffer_set_fence (priv->generated_output_buf,
+        fence, fence_val, FALSE);
   }
   GST_OBJECT_UNLOCK (self);
 

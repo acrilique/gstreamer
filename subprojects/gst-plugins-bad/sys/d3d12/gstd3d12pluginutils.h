@@ -49,13 +49,12 @@ enum GstD3D12MSAAMode
 #define GST_TYPE_D3D12_MSAA_MODE (gst_d3d12_msaa_mode_get_type())
 GType gst_d3d12_msaa_mode_get_type (void);
 
-void          gst_d3d12_buffer_after_write (GstBuffer * buffer,
-                                            guint64 fence_value);
-
 gboolean      gst_d3d12_need_transform (gfloat rotation_x,
                                         gfloat rotation_y,
                                         gfloat rotation_z,
                                         gfloat scale_x,
                                         gfloat scale_y);
+
+gboolean      gst_d3d12_is_windows_10_or_greater (void);
 
 G_END_DECLS
