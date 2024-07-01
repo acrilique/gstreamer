@@ -44,7 +44,7 @@ option('build-tools-source', type: 'combo', choices: ['system', 'subproject'], v
 option('virtme_kernel_image', type: 'string', value: '', description: 'Path to a Linux kernel image to be used for virtme testing')
 
 # License-related feature options
-option('gpl', type: 'feature', value: 'disabled',
+option('gpl', type: 'feature', value: 'enabled',
   description: 'Allow build of plugins that have (A)GPL-licensed dependencies')
 option('gstreamer-full-license', type : 'string', value : 'unknown',
        description : 'gstreamer-full license (default unknown)')
