@@ -67,7 +67,6 @@ struct _GstFFMpegDemux
   guint group_id;
 
   AVFormatContext *context;
-  gboolean opened;
 
   GstFFStream *streams[MAX_STREAMS];
 
@@ -273,7 +272,6 @@ gst_ffmpegdemux_init (GstFFMpegDemux * demux)
   demux->have_group_id = FALSE;
   demux->group_id = G_MAXUINT;
 
-  demux->opened = FALSE;
   demux->context = NULL;
 
   for (n = 0; n < MAX_STREAMS; n++) {
@@ -324,7 +322,7 @@ gst_ffmpegdemux_close (GstFFMpegDemux * demux)
   gint n;
   GstEvent **event_p;
 
-  if (!demux->opened)
+  if (!demux->context)
     return;
 
   /* remove pads from ourselves */
@@ -353,12 +351,8 @@ gst_ffmpegdemux_close (GstFFMpegDemux * demux)
     gst_ffmpeg_pipe_close (demux->context->pb);
   demux->context->pb = NULL;
   avformat_close_input (&demux->context);
-  if (demux->context)
-    avformat_free_context (demux->context);
-  demux->context = NULL;
 
   GST_OBJECT_LOCK (demux);
-  demux->opened = FALSE;
   event_p = &demux->seek_event;
   gst_event_replace (event_p, NULL);
   GST_OBJECT_UNLOCK (demux);
@@ -700,7 +694,7 @@ gst_ffmpegdemux_send_event (GstElement * element, GstEvent * event)
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_SEEK:
       GST_OBJECT_LOCK (demux);
-      if (!demux->opened) {
+      if (!demux->context) {
         GstEvent **event_p;
 
         GST_DEBUG_OBJECT (demux, "caching seek event");
@@ -1309,7 +1303,6 @@ gst_ffmpegdemux_open (GstFFMpegDemux * demux)
   demux->segment.duration = demux->duration;
 
   GST_OBJECT_LOCK (demux);
-  demux->opened = TRUE;
   event = demux->seek_event;
   demux->seek_event = NULL;
   cached_events = demux->cached_events;
@@ -1366,66 +1359,18 @@ gst_ffmpegdemux_open (GstFFMpegDemux * demux)
   /* ERRORS */
 beach:
   {
+    if (demux->context->pb) {
+      if (demux->seekable)
+        gst_ffmpegdata_close (demux->context->pb);
+      else
+        gst_ffmpeg_pipe_close (demux->context->pb);
+      demux->context->pb = NULL;
+    }
+    avformat_close_input (&demux->context);
+
     GST_ELEMENT_ERROR (demux, LIBRARY, FAILED, (NULL),
         ("%s", gst_ffmpegdemux_averror (res)));
     return FALSE;
-  }
-}
-
-#define GST_FFMPEG_TYPE_FIND_SIZE 4096
-#define GST_FFMPEG_TYPE_FIND_MIN_SIZE 256
-
-static void
-gst_ffmpegdemux_type_find (GstTypeFind * tf, gpointer priv)
-{
-  const guint8 *data;
-  AVInputFormat *in_plugin = (AVInputFormat *) priv;
-  gint res = 0;
-  guint64 length;
-  GstCaps *sinkcaps;
-
-  /* We want GST_FFMPEG_TYPE_FIND_SIZE bytes, but if the file is shorter than
-   * that we'll give it a try... */
-  length = gst_type_find_get_length (tf);
-  if (length == 0 || length > GST_FFMPEG_TYPE_FIND_SIZE)
-    length = GST_FFMPEG_TYPE_FIND_SIZE;
-
-  /* The ffmpeg typefinders assume there's a certain minimum amount of data
-   * and will happily do invalid memory access if there isn't, so let's just
-   * skip the ffmpeg typefinders if the data available is too short
-   * (in which case it's unlikely to be a media file anyway) */
-  if (length < GST_FFMPEG_TYPE_FIND_MIN_SIZE) {
-    GST_LOG ("not typefinding %" G_GUINT64_FORMAT " bytes, too short", length);
-    return;
-  }
-
-  GST_LOG ("typefinding %" G_GUINT64_FORMAT " bytes", length);
-  if (in_plugin->read_probe &&
-      (data = gst_type_find_peek (tf, 0, length)) != NULL) {
-    AVProbeData probe_data;
-
-    probe_data.filename = "";
-    probe_data.buf = (guint8 *) data;
-    probe_data.buf_size = length;
-
-    res = in_plugin->read_probe (&probe_data);
-    if (res > 0) {
-      res = MAX (1, res * GST_TYPE_FIND_MAXIMUM / AVPROBE_SCORE_MAX);
-      /* Restrict the probability for MPEG-TS streams, because there is
-       * probably a better version in plugins-base, if the user has a recent
-       * plugins-base (in fact we shouldn't even get here for ffmpeg mpegts or
-       * mpegtsraw typefinders, since we blacklist them) */
-      if (g_str_has_prefix (in_plugin->name, "mpegts"))
-        res = MIN (res, GST_TYPE_FIND_POSSIBLE);
-
-      sinkcaps = gst_ffmpeg_formatid_to_caps (in_plugin->name);
-
-      GST_LOG ("libav typefinder '%s' suggests %" GST_PTR_FORMAT ", p=%u%%",
-          in_plugin->name, sinkcaps, res);
-
-      gst_type_find_suggest (tf, res, sinkcaps);
-      gst_caps_unref (sinkcaps);
-    }
   }
 }
 
@@ -1447,7 +1392,7 @@ gst_ffmpegdemux_loop (GstFFMpegDemux * demux)
   gint64 pts;
 
   /* open file if we didn't so already */
-  if (!demux->opened)
+  if (!demux->context)
     if (!gst_ffmpegdemux_open (demux))
       goto open_failed;
 
@@ -1782,7 +1727,7 @@ gst_ffmpegdemux_sink_event (GstPad * sinkpad, GstObject * parent,
        * If the demuxer isn't opened, push straight away, since we'll
        * be waiting against a cond that will never be signalled. */
       if (GST_EVENT_IS_SERIALIZED (event)) {
-        if (demux->opened) {
+        if (demux->context) {
           GST_FFMPEG_PIPE_MUTEX_LOCK (ffpipe);
           while (!ffpipe->needed)
             GST_FFMPEG_PIPE_WAIT (ffpipe);
@@ -2055,7 +2000,6 @@ gst_ffmpegdemux_register (GstPlugin * plugin)
   while ((in_plugin = av_demuxer_iterate (&i))) {
     gchar *type_name, *typefind_name;
     gint rank;
-    gboolean register_typefind_func = TRUE;
 
     GST_LOG ("Attempting to handle libav demuxer plugin %s [%s]",
         in_plugin->name, in_plugin->long_name);
@@ -2101,42 +2045,6 @@ gst_ffmpegdemux_register (GstPlugin * plugin)
         !strcmp (in_plugin->name, "ass") ||
         !strcmp (in_plugin->name, "ffmetadata"))
       continue;
-
-    /* Don't use the typefind functions of formats for which we already have
-     * better typefind functions */
-    if (!strcmp (in_plugin->name, "mov,mp4,m4a,3gp,3g2,mj2") ||
-        !strcmp (in_plugin->name, "ass") ||
-        !strcmp (in_plugin->name, "avi") ||
-        !strcmp (in_plugin->name, "asf") ||
-        !strcmp (in_plugin->name, "mpegvideo") ||
-        !strcmp (in_plugin->name, "mp3") ||
-        !strcmp (in_plugin->name, "matroska") ||
-        !strcmp (in_plugin->name, "matroska_webm") ||
-        !strcmp (in_plugin->name, "matroska,webm") ||
-        !strcmp (in_plugin->name, "mpeg") ||
-        !strcmp (in_plugin->name, "wav") ||
-        !strcmp (in_plugin->name, "au") ||
-        !strcmp (in_plugin->name, "tta") ||
-        !strcmp (in_plugin->name, "rm") ||
-        !strcmp (in_plugin->name, "amr") ||
-        !strcmp (in_plugin->name, "ogg") ||
-        !strcmp (in_plugin->name, "aiff") ||
-        !strcmp (in_plugin->name, "ape") ||
-        !strcmp (in_plugin->name, "dv") ||
-        !strcmp (in_plugin->name, "flv") ||
-        !strcmp (in_plugin->name, "mpc") ||
-        !strcmp (in_plugin->name, "mpc8") ||
-        !strcmp (in_plugin->name, "mpegts") ||
-        !strcmp (in_plugin->name, "mpegtsraw") ||
-        !strcmp (in_plugin->name, "mxf") ||
-        !strcmp (in_plugin->name, "nuv") ||
-        !strcmp (in_plugin->name, "swf") ||
-        !strcmp (in_plugin->name, "voc") ||
-        !strcmp (in_plugin->name, "pva") ||
-        !strcmp (in_plugin->name, "gif") ||
-        !strcmp (in_plugin->name, "vc1test") ||
-        !strcmp (in_plugin->name, "ivf"))
-      register_typefind_func = FALSE;
 
     /* Set the rank of demuxers known to work to MARGINAL.
      * Set demuxers for which we already have another implementation to NONE
@@ -2214,11 +2122,7 @@ gst_ffmpegdemux_register (GstPlugin * plugin)
     else
       extensions = NULL;
 
-    if (!gst_element_register (plugin, type_name, rank, type) ||
-        (register_typefind_func == TRUE &&
-            !gst_type_find_register (plugin, typefind_name, rank,
-                gst_ffmpegdemux_type_find, extensions, NULL,
-                (gpointer) in_plugin, NULL))) {
+    if (!gst_element_register (plugin, type_name, rank, type)) {
       g_warning ("Registration of type %s failed", type_name);
       g_free (type_name);
       g_free (typefind_name);
