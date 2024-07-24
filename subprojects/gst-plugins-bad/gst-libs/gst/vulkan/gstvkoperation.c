@@ -784,8 +784,8 @@ gst_vulkan_operation_new_extra_image_barriers (GstVulkanOperation * self)
  *     gst_vulkan_operation_new_extra_image_barriers() and
  *     gst_vulkan_operation_update_frame()
  *
- * Any non-repeated image barrier in @extra is appended to the internal barrier
- * list.
+ * Any non-repeated image barrier in @extra_barriers is appended to the internal
+ * barrier list.
  *
  * Remember to call gst_vulkan_operation_update_frame() on those frames with
  * images in @extra_barriers.
@@ -859,6 +859,8 @@ gst_vulkan_operation_add_extra_image_barriers (GstVulkanOperation * self,
  * gst_vulkan_operation_add_frame_barrier:
  * @self: a #GstVulkanOperation
  * @frame: a Vulkan Image #GstBuffer
+ * @src_stage: source pipeline stage (VkPipelineStageFlags or
+ *   VkPipelineStageFlags2)
  * @dst_stage: destination pipeline stage (VkPipelineStageFlags or
  *   VkPipelineStageFlags2)
  * @new_access: the new access flags (VkAccessFlags2 or VkAccessFlags)
@@ -876,7 +878,7 @@ gst_vulkan_operation_add_extra_image_barriers (GstVulkanOperation * self,
  */
 gboolean
 gst_vulkan_operation_add_frame_barrier (GstVulkanOperation * self,
-    GstBuffer * frame, guint64 dst_stage, guint64 new_access,
+    GstBuffer * frame, guint64 src_stage, guint64 dst_stage, guint64 new_access,
     VkImageLayout new_layout, GstVulkanQueue * new_queue)
 {
   guint i, n_mems;
@@ -932,8 +934,7 @@ gst_vulkan_operation_add_frame_barrier (GstVulkanOperation * self,
       VkImageMemoryBarrier2KHR barrier2  = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR,
         .pNext = NULL,
-        .srcStageMask = dep_frame ?
-            dep_frame->dst_stage : vkmem->barrier.parent.pipeline_stages,
+        .srcStageMask = src_stage,
         .dstStageMask = dst_stage,
         .srcAccessMask = dep_frame ?
             dep_frame->new_access : vkmem->barrier.parent.access_flags,
@@ -1332,8 +1333,9 @@ gst_vulkan_operation_get_query (GstVulkanOperation * self, gpointer * result,
 /**
  * gst_vulkan_operation_begin_query:
  * @self: a #GstVulkanOperation
+ * @id: query id
  *
- * Begins a query operation in the current command buffer.
+ * Begins a query operation with @id in the current command buffer.
  *
  * Returns: whether the begin command was set
  */
@@ -1363,8 +1365,10 @@ gst_vulkan_operation_begin_query (GstVulkanOperation * self, guint32 id)
 /**
  * gst_vulkan_operation_end_query:
  * @self: a #GstVulkanOperation
+ * @id: query id
  *
- * Ends a query operation in the current command buffer.
+ * Ends a query operation with @id in the current command buffer. A query with
+ * @id has had started with gst_vulkan_operation_begin_query()
  *
  * Returns: whether the end command was set
  */

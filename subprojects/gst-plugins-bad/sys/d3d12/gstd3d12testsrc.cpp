@@ -226,7 +226,6 @@ struct RenderContext
 {
   RenderContext (GstD3D12Device * dev)
   {
-    event_handle = CreateEventEx (nullptr, nullptr, 0, EVENT_ALL_ACCESS);
     device = (GstD3D12Device *) gst_object_ref (dev);
     auto device_handle = gst_d3d12_device_get_device_handle (device);
     ca_pool = gst_d3d12_command_allocator_pool_new (device_handle,
@@ -236,9 +235,7 @@ struct RenderContext
   ~RenderContext ()
   {
     gst_d3d12_device_fence_wait (device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-        fence_val, event_handle);
-
-    CloseHandle (event_handle);
+        fence_val);
 
     {
       GstD3D12Device11on12LockGuard lk (device);
@@ -290,7 +287,6 @@ struct RenderContext
   StaticColor static_color[2];
   std::vector < std::shared_ptr < GstD3D12TestSrcQuad >> quad;
   GstD3D12TestSrcPattern pattern;
-  HANDLE event_handle;
   guint64 fence_val = 0;
 };
 
@@ -1880,7 +1876,7 @@ gst_d3d12_test_src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
     if (!params) {
       params = gst_d3d12_allocation_params_new (self->device, &vinfo,
           GST_D3D12_ALLOCATION_FLAG_DEFAULT, resource_flags,
-          D3D12_HEAP_FLAG_NONE);
+          D3D12_HEAP_FLAG_SHARED);
     } else {
       gst_d3d12_allocation_params_set_resource_flags (params, resource_flags);
       gst_d3d12_allocation_params_unset_resource_flags (params,
@@ -2183,7 +2179,7 @@ gst_d3d12_test_src_create (GstBaseSrc * bsrc, guint64 offset,
     auto fence_to_wait = priv->ctx->scheduled.front ();
     priv->ctx->scheduled.pop ();
     gst_d3d12_device_fence_wait (self->device,
-        D3D12_COMMAND_LIST_TYPE_DIRECT, fence_to_wait, priv->ctx->event_handle);
+        D3D12_COMMAND_LIST_TYPE_DIRECT, fence_to_wait);
   }
 
   GstD3D12CommandAllocator *gst_ca;

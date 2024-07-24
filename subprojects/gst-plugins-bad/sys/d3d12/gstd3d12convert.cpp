@@ -80,7 +80,6 @@ struct ConvertContext
 {
   ConvertContext (GstD3D12Device * dev)
   {
-    event_handle = CreateEventEx (nullptr, nullptr, 0, EVENT_ALL_ACCESS);
     device = (GstD3D12Device *) gst_object_ref (dev);
     auto device_handle = gst_d3d12_device_get_device_handle (device);
     ca_pool = gst_d3d12_command_allocator_pool_new (device_handle,
@@ -90,9 +89,8 @@ struct ConvertContext
    ~ConvertContext ()
   {
     gst_d3d12_device_fence_wait (device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-        fence_val, event_handle);
+        fence_val);
 
-    CloseHandle (event_handle);
     gst_clear_object (&ca_pool);
     gst_clear_object (&conv);
     gst_clear_object (&device);
@@ -103,7 +101,6 @@ struct ConvertContext
   ComPtr<ID3D12GraphicsCommandList> cl;
   std::queue<guint64> scheduled;
   GstD3D12CommandAllocatorPool *ca_pool;
-  HANDLE event_handle;
   guint64 fence_val = 0;
 };
 
@@ -1574,7 +1571,10 @@ gst_d3d12_convert_decide_allocation (GstBaseTransform * trans, GstQuery * query)
   if ((device_format.format_flags & GST_D3D12_FORMAT_FLAG_OUTPUT_UAV)
       == GST_D3D12_FORMAT_FLAG_OUTPUT_UAV) {
     resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-  } else {
+  }
+
+  if ((device_format.support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) ==
+      D3D12_FORMAT_SUPPORT1_RENDER_TARGET) {
     resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   }
 
@@ -1583,7 +1583,7 @@ gst_d3d12_convert_decide_allocation (GstBaseTransform * trans, GstQuery * query)
   if (!d3d12_params) {
     d3d12_params = gst_d3d12_allocation_params_new (filter->device, &info,
         GST_D3D12_ALLOCATION_FLAG_DEFAULT, resource_flags,
-        D3D12_HEAP_FLAG_NONE);
+        D3D12_HEAP_FLAG_SHARED);
   } else {
     gst_d3d12_allocation_params_set_resource_flags (d3d12_params,
         resource_flags);
@@ -1984,7 +1984,7 @@ gst_d3d12_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     auto fence_to_wait = priv->ctx->scheduled.front ();
     priv->ctx->scheduled.pop ();
     gst_d3d12_device_fence_wait (priv->ctx->device,
-        D3D12_COMMAND_LIST_TYPE_DIRECT, fence_to_wait, priv->ctx->event_handle);
+        D3D12_COMMAND_LIST_TYPE_DIRECT, fence_to_wait);
   }
 
   GstD3D12CommandAllocator *gst_ca;

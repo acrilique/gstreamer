@@ -423,8 +423,9 @@ _buffer_to_image_perform (gpointer impl, GstBuffer * inbuf, GstBuffer ** outbuf)
   cmd_buf = raw->exec->cmd_buf;
 
   if (!gst_vulkan_operation_add_frame_barrier (raw->exec, *outbuf,
-          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, NULL))
+          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          NULL))
     goto unlock_error;
 
   barriers = gst_vulkan_operation_retrieve_image_barriers (raw->exec);
@@ -686,7 +687,8 @@ _raw_to_image_perform (gpointer impl, GstBuffer * inbuf, GstBuffer ** outbuf)
 
   if (!gst_vulkan_operation_add_frame_barrier (raw->exec, *outbuf,
           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, NULL))
+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          NULL))
     goto unlock_error;
 
   barriers = gst_vulkan_operation_retrieve_image_barriers (raw->exec);
@@ -1163,17 +1165,31 @@ gst_vulkan_upload_change_state (GstElement * element, GstStateChange transition)
           return GST_STATE_CHANGE_FAILURE;
         }
       }
-
-      if (!gst_vulkan_queue_run_context_query (GST_ELEMENT (vk_upload),
+      // Issue with NVIDIA driver where the output gets artifacts if I select another
+      // queue seen the codec one does not support VK_QUEUE_GRAPHICS_BIT but VK_QUEUE_TRANSFER_BIT.
+      if (gst_vulkan_queue_run_context_query (GST_ELEMENT (vk_upload),
               &vk_upload->queue)) {
-        GST_DEBUG_OBJECT (vk_upload, "No queue retrieved from peer elements");
+        guint32 flags, idx;
+
+        GST_DEBUG_OBJECT (vk_upload, "Queue retrieved from peer elements");
+        idx = vk_upload->queue->family;
+        flags = vk_upload->device->physical_device->queue_family_props[idx]
+            .queueFlags;
+        if ((flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT)) == 0) {
+          GST_DEBUG_OBJECT (vk_upload,
+              "Queue does not support VK_QUEUE_GRAPHICS_BIT with VK_QUEUE_TRANSFER_BIT");
+          gst_clear_object (&vk_upload->queue);
+        }
+      }
+
+      if (!vk_upload->queue) {
         vk_upload->queue =
             gst_vulkan_device_select_queue (vk_upload->device,
             VK_QUEUE_GRAPHICS_BIT);
       }
       if (!vk_upload->queue) {
         GST_ELEMENT_ERROR (vk_upload, RESOURCE, NOT_FOUND,
-            ("Failed to create/retrieve vulkan queue"), (NULL));
+            ("Failed to create/retrieve a valid vulkan queue"), (NULL));
         return GST_STATE_CHANGE_FAILURE;
       }
       break;
@@ -1339,6 +1355,9 @@ gst_vulkan_upload_decide_allocation (GstBaseTransform * bt, GstQuery * query)
   GstCaps *caps;
   guint min, max, size;
   gboolean update_pool;
+  const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+      | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+      | VK_IMAGE_USAGE_STORAGE_BIT;
 
   gst_query_parse_allocation (query, &caps, NULL);
   if (!caps)
@@ -1367,6 +1386,8 @@ gst_vulkan_upload_decide_allocation (GstBaseTransform * bt, GstQuery * query)
   config = gst_buffer_pool_get_config (pool);
 
   gst_buffer_pool_config_set_params (config, caps, size, min, max);
+  gst_vulkan_image_buffer_pool_config_set_allocation_params (config, usage,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_IMAGE_LAYOUT_UNDEFINED, 0);
 
   if (!gst_buffer_pool_set_config (pool, config)) {
     gst_object_unref (pool);

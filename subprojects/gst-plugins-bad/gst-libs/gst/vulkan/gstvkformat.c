@@ -172,9 +172,7 @@ static GstVulkanFormatInfo formats[] = {
   {FORMAT (R8, UINT), FLAG (RGB) | NE, DPTH8, PSTR4, PLANE0, OFFS0, SUB4, VK_IMAGE_ASPECT_COLOR_BIT},
   {FORMAT (R8, SINT), FLAG (RGB) | NE, DPTH8, PSTR4, PLANE0, OFFS0, SUB4, VK_IMAGE_ASPECT_COLOR_BIT},
   {FORMAT (R8, SRGB), FLAG (RGB) | NE, DPTH8, PSTR4, PLANE0, OFFS0, SUB4, VK_IMAGE_ASPECT_COLOR_BIT},
-#if (defined(VK_VERSION_1_3) || defined(VK_VERSION_1_2) && VK_HEADER_VERSION >= 199)
   {FORMAT (G8_B8R8_2PLANE_420, UNORM), FLAG (YUV), DPTH888, PSTR122, PLANE011, OFFS001, SUB420, ASPECT_2PLANE},
-#endif
 #if 0
 FIXME: implement:
   {VK_FORMAT_R4G4_UNORM_PACK8, {0, 1, -1, -1}},
@@ -433,11 +431,7 @@ gst_vulkan_format_get_aspect (VkFormat format)
 }
 
 /* *INDENT-OFF* */
-const static struct {
-  GstVideoFormat format;
-  VkFormat vkfrmt;
-  VkFormat vkfrmts[GST_VIDEO_MAX_PLANES];
-} vk_formats_map[] = {
+const static GstVulkanFormatMap vk_formats_map[] = {
   /* RGB                   unsigned normalized format         sRGB nonlinear encoding */
   { GST_VIDEO_FORMAT_RGBA,  VK_FORMAT_R8G8B8A8_UNORM,      { VK_FORMAT_R8G8B8A8_SRGB, } },
   { GST_VIDEO_FORMAT_RGBx,  VK_FORMAT_R8G8B8A8_UNORM,      { VK_FORMAT_R8G8B8A8_SRGB, } },
@@ -459,13 +453,7 @@ const static struct {
   { GST_VIDEO_FORMAT_AYUV, VK_FORMAT_UNDEFINED, { VK_FORMAT_R8G8B8A8_UNORM, } },
   { GST_VIDEO_FORMAT_YUY2, VK_FORMAT_UNDEFINED, { VK_FORMAT_R8G8_UNORM, } },
   { GST_VIDEO_FORMAT_UYVY, VK_FORMAT_UNDEFINED, { VK_FORMAT_R8G8_UNORM, } },
-  { GST_VIDEO_FORMAT_NV12,
-#if (defined(VK_VERSION_1_3) || defined(VK_VERSION_1_2) && VK_HEADER_VERSION >= 199)
-    VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
-#else
-    VK_FORMAT_UNDEFINED,
-#endif
-    { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM } },
+  { GST_VIDEO_FORMAT_NV12, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM } },
   { GST_VIDEO_FORMAT_NV21, VK_FORMAT_UNDEFINED, { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM } },
   { GST_VIDEO_FORMAT_Y444, VK_FORMAT_UNDEFINED, { VK_FORMAT_R8_UNORM,  } },
   { GST_VIDEO_FORMAT_Y42B, VK_FORMAT_UNDEFINED, { VK_FORMAT_R8_UNORM, } },
@@ -474,6 +462,28 @@ const static struct {
   { GST_VIDEO_FORMAT_YV12, VK_FORMAT_UNDEFINED, { VK_FORMAT_R8_UNORM, } },
 };
 /* *INDENT-ON* */
+
+/**
+ * gst_vulkan_format_get_map: (skip)
+ * @format: the #GstVideoFormat to get
+ *
+ * Returns: (nullable): the #GstVulkanFormatMap matching with @format
+ *
+ * Since: 1.26
+ */
+const GstVulkanFormatMap *
+gst_vulkan_format_get_map (GstVideoFormat format)
+{
+  guint i;
+
+  for (i = 0; i < G_N_ELEMENTS (vk_formats_map); i++) {
+    if (vk_formats_map[i].format != format)
+      continue;
+    return &vk_formats_map[i];
+  }
+
+  return NULL;
+}
 
 /**
  * gst_vulkan_format_from_video_info: (skip)
@@ -534,12 +544,10 @@ _get_usage (guint64 feature)
           VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR},
     {VK_FORMAT_FEATURE_2_VIDEO_DECODE_DPB_BIT_KHR,
           VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR},
-#ifdef VK_ENABLE_BETA_EXTENSIONS
     {VK_FORMAT_FEATURE_2_VIDEO_ENCODE_DPB_BIT_KHR,
           VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR},
     {VK_FORMAT_FEATURE_2_VIDEO_ENCODE_INPUT_BIT_KHR,
           VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR},
-#endif
 #endif
   };
   /* *INDENT-ON* */
