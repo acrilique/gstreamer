@@ -1154,6 +1154,9 @@ gst_adaptive_demux2_stream_create_parser (GstAdaptiveDemux2Stream * stream)
     }
 
     stream->parsebin = gst_element_factory_make ("parsebin", NULL);
+    if (stream->parsebin == NULL) {
+      return FALSE;
+    }
     if (tsdemux_type)
       g_signal_connect (stream->parsebin, "deep-element-added",
           (GCallback) parsebin_deep_element_added_cb, demux);
@@ -1969,6 +1972,9 @@ gst_adaptive_demux2_stream_load_a_fragment (GstAdaptiveDemux2Stream * stream)
       if (gst_adaptive_demux2_stream_download_fragment (stream) != GST_FLOW_OK) {
         GST_ERROR_OBJECT (demux,
             "Failed to begin fragment download for stream %p", stream);
+        GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
+            (_("Failed to initiate fragment download.")),
+            ("An error happened when getting fragment URL"));
         return FALSE;
       }
       break;

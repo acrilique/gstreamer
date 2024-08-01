@@ -81,7 +81,11 @@ G_DEFINE_TYPE_WITH_CODE (GstVulkanImageBufferPool, gst_vulkan_image_buffer_pool,
  * @initial_access: Access flags for the layout transition if @initial_layout is
  * not VK_IMAGE_LAYOUT_UNDEFINED or VK_IMAGE_LAYOUT_PREINITIALIZED.
  *
- * Sets the @usage and @mem_properties of the images to setup.
+ * Sets the @usage and @mem_properties, @initial_layout and @initial_access of
+ * the images to setup.
+ *
+ * If @initial_access is VK_IMAGE_LAYOUT_UNDEFINED or
+ * VK_IMAGE_LAYOUT_PREINITIALIZED images does not do layout initialization.
  *
  * Since: 1.24
  */
@@ -90,6 +94,8 @@ gst_vulkan_image_buffer_pool_config_set_allocation_params (GstStructure *
     config, VkImageUsageFlags usage, VkMemoryPropertyFlags mem_properties,
     VkImageLayout initial_layout, guint64 initial_access)
 {
+  g_return_if_fail (GST_IS_STRUCTURE (config));
+
   /* assumption: G_TYPE_UINT is compatible with uint32_t (VkFlags) */
   gst_structure_set (config, "usage", G_TYPE_UINT, usage, "memory-properties",
       G_TYPE_UINT, mem_properties, "initial-layout", G_TYPE_UINT,
@@ -134,23 +140,54 @@ gst_vulkan_image_buffer_pool_config_set_encode_caps (GstStructure * config,
   gst_structure_set (config, "encode-caps", GST_TYPE_CAPS, caps, NULL);
 }
 
-static inline gboolean
+/**
+ * gst_vulkan_image_buffer_pool_config_get_allocation_params:
+ * @config: the #GstStructure with the pool's configuration.
+ * @usage: (out) (optional): The Vulkan image usage flags.
+ * @mem_properties: (out) (optional): Vulkan memory property flags.
+ * @initial_layout: (out) (optional): Initial Vulkan image layout.
+ * @initial_access: (out) (optional): Initial Vulkan access flags.
+ *
+ * Gets the configuration of the Vulkan image buffer pool.
+ *
+ * Since: 1.26
+ */
+void
 gst_vulkan_image_buffer_pool_config_get_allocation_params (GstStructure *
     config, VkImageUsageFlags * usage, VkMemoryPropertyFlags * mem_props,
+    VkImageLayout * initial_layout, guint64 * initial_access)
+{
+  g_return_if_fail (GST_IS_STRUCTURE (config));
+
+  if (usage) {
+    if (!gst_structure_get_uint (config, "usage", usage))
+      *usage = default_usage;
+  }
+
+  if (mem_props) {
+    if (!gst_structure_get_uint (config, "memory-properties", mem_props))
+      *mem_props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+  }
+
+  if (initial_layout) {
+    if (!gst_structure_get_uint (config, "initial-layout", initial_layout))
+      *initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  }
+
+  if (initial_access) {
+    if (!gst_structure_get_uint64 (config, "initial-access", initial_access))
+      *initial_access = 0;      /* VK_ACCESS_NONE */
+  }
+}
+
+static inline void
+internal_config_get_allocation_params (GstStructure * config,
+    VkImageUsageFlags * usage, VkMemoryPropertyFlags * mem_props,
     VkImageLayout * initial_layout, guint64 * initial_access,
     guint32 * n_layers, GstCaps ** decode_caps, GstCaps ** encode_caps)
 {
-  if (!gst_structure_get_uint (config, "usage", usage))
-    *usage = default_usage;
-
-  if (!gst_structure_get_uint (config, "memory-properties", mem_props))
-    *mem_props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-  if (!gst_structure_get_uint (config, "initial-layout", initial_layout))
-    *initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-  if (!gst_structure_get_uint64 (config, "initial-access", initial_access))
-    *initial_access = 0;
+  gst_vulkan_image_buffer_pool_config_get_allocation_params (config, usage,
+      mem_props, initial_layout, initial_access);
 
   if (!gst_structure_get_uint (config, "num-layers", n_layers))
     *n_layers = 1;
@@ -160,8 +197,6 @@ gst_vulkan_image_buffer_pool_config_get_allocation_params (GstStructure *
 
   if (encode_caps)
     gst_structure_get (config, "encode-caps", GST_TYPE_CAPS, encode_caps, NULL);
-
-  return TRUE;
 }
 
 static gboolean
@@ -171,11 +206,10 @@ gst_vulkan_image_buffer_pool_set_config (GstBufferPool * pool,
   GstVulkanImageBufferPool *vk_pool = GST_VULKAN_IMAGE_BUFFER_POOL_CAST (pool);
   GstVulkanImageBufferPoolPrivate *priv = GET_PRIV (vk_pool);
   VkImageTiling tiling;
-  VkImageUsageFlags requested_usage, supported_usage;
+  VkImageUsageFlags requested_usage;
   VkImageCreateInfo image_info;
   guint min_buffers, max_buffers;
   GstCaps *caps = NULL, *decode_caps = NULL, *encode_caps = NULL;
-
   GstCapsFeatures *features;
   gboolean found, no_multiplane, ret = TRUE;
   guint i;
@@ -200,15 +234,16 @@ gst_vulkan_image_buffer_pool_set_config (GstBufferPool * pool,
   priv->raw_caps = features == NULL || gst_caps_features_is_equal (features,
       GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY);
 
-  gst_vulkan_image_buffer_pool_config_get_allocation_params (config,
-      &priv->usage, &priv->mem_props, &priv->initial_layout,
-      &priv->initial_access, &priv->n_layers, &decode_caps, &encode_caps);
-
+  internal_config_get_allocation_params (config, &requested_usage,
+      &priv->mem_props, &priv->initial_layout, &priv->initial_access,
+      &priv->n_layers, &decode_caps, &encode_caps);
 
 #if GST_VULKAN_HAVE_VIDEO_EXTENSIONS
   {
     guint n = 0;
-    if (decode_caps && ((priv->usage
+
+    priv->n_profiles = 0;
+    if (decode_caps && ((requested_usage
                 & (VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR
                     | VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR)) != 0)) {
       n++;
@@ -217,7 +252,7 @@ gst_vulkan_image_buffer_pool_set_config (GstBufferPool * pool,
         priv->n_profiles++;
     }
     gst_clear_caps (&decode_caps);
-    if (encode_caps && ((priv->usage
+    if (encode_caps && ((requested_usage
                 & (VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR
                     | VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR)) != 0)) {
       n++;
@@ -232,37 +267,30 @@ gst_vulkan_image_buffer_pool_set_config (GstBufferPool * pool,
   }
   if (priv->n_profiles > 0) {
     no_multiplane = FALSE;
-
-    /* HACK(victor): NVIDIA & RADV drivers don't report decoding features for
-     * color format. Setting usage to zero to short circuit validation. */
-    requested_usage = 0;
   } else
 #endif
   {
     no_multiplane = TRUE;
-    requested_usage = priv->usage;
   }
 
   tiling = priv->raw_caps ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
   found = gst_vulkan_format_from_video_info_2 (vk_pool->device->physical_device,
       &priv->v_info, tiling, no_multiplane, requested_usage, priv->vk_fmts,
-      &priv->n_imgs, &supported_usage);
+      &priv->n_imgs, NULL);
   if (!found)
     goto no_vk_format;
-
-  if (priv->usage == 0) {
-    priv->usage = supported_usage & default_usage;
-  }
 
   {
     gboolean video = FALSE, sampleable;
     const GstVulkanFormatMap *vkmap;
 
 #if GST_VULKAN_HAVE_VIDEO_EXTENSIONS
-    video = (priv->usage & (VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR
-            | VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR));
+    video = (requested_usage & (VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR
+            | VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR
+            | VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR
+            | VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR));
 #endif
-    sampleable = priv->usage &
+    sampleable = requested_usage &
         (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
 
     if (sampleable && !video) {
@@ -289,7 +317,7 @@ gst_vulkan_image_buffer_pool_set_config (GstBufferPool * pool,
     .arrayLayers = priv->n_layers,
     .samples = VK_SAMPLE_COUNT_1_BIT,
     .tiling = tiling,
-    .usage = priv->usage,
+    .usage = requested_usage,
     .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     .queueFamilyIndexCount = 0,
     .pQueueFamilyIndices = NULL,
@@ -346,6 +374,8 @@ gst_vulkan_image_buffer_pool_set_config (GstBufferPool * pool,
 
   gst_buffer_pool_config_set_params (config, caps,
       priv->v_info.size, min_buffers, max_buffers);
+
+  priv->usage = requested_usage;
 
   return GST_BUFFER_POOL_CLASS (parent_class)->set_config (pool, config) && ret;
 
